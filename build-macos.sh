@@ -1,32 +1,32 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-echo "=== Grain Video Editor — macOS Build Script ==="
+echo "=== Grain Video & Audio Editor — 100% Pure Rust macOS Build ==="
 
 if ! command -v cargo >/dev/null 2>&1; then
-  echo "Error: Rust (cargo) is not installed. Install via: curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh"
+  echo "Error: Rust is not installed. Install via: curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh"
   exit 1
 fi
 
-if ! command -v npm >/dev/null 2>&1; then
-  echo "Error: Node.js / npm is not installed."
-  exit 1
+if ! command -v cargo-bundle >/dev/null 2>&1; then
+  echo "Installing cargo-bundle for macOS .app packaging..."
+  cargo install cargo-bundle
 fi
 
 if ! command -v ffmpeg >/dev/null 2>&1; then
-  echo "Warning: ffmpeg not found on PATH. Install via Homebrew for native hardware export: brew install ffmpeg pkg-config"
+  echo "Warning: ffmpeg not found. Install via Homebrew for hardware export: brew install ffmpeg"
 fi
 
-echo "1. Installing npm dependencies..."
-npm install
-
-echo "2. Adding macOS Rust targets (Apple Silicon + Intel)..."
+echo "Building Universal macOS .app bundle (Apple Silicon + Intel)..."
 rustup target add aarch64-apple-darwin x86_64-apple-darwin || true
+cargo bundle --release --target universal-apple-darwin || cargo bundle --release
 
-echo "3. Building Universal macOS .app and .dmg..."
-npm run build -- --target universal-apple-darwin
+APP_PATH=$(find target -name "Grain Video Editor.app" | head -n 1)
+echo "Built macOS App: ${APP_PATH}"
 
-echo ""
-echo "Build complete! Artifacts:"
-echo "  App: src-tauri/target/universal-apple-darwin/release/bundle/macos/Grain Video Editor.app"
-echo "  DMG: src-tauri/target/universal-apple-darwin/release/bundle/dmg/Grain Video Editor_0.1.0_universal.dmg"
+if [ -n "${APP_PATH}" ] && command -v hdiutil >/dev/null 2>&1; then
+  DMG_PATH="target/Grain-Video-Editor-macOS.dmg"
+  rm -f "${DMG_PATH}"
+  hdiutil create -volname "Grain Video Editor" -srcfolder "${APP_PATH}" -ov -format UDZO "${DMG_PATH}"
+  echo "Created macOS Installer DMG: ${DMG_PATH}"
+fi
