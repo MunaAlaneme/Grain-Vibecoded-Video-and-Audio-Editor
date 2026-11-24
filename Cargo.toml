@@ -2,7 +2,7 @@
 name = "grain-video-editor"
 version = "0.3.0"
 edition = "2021"
-description = "Grain Video & Audio Editor — 100% Pure Rust native macOS application (Zero JavaScript)"
+description = "Grain Video & Audio Editor — 100% Pure Rust native macOS M3 Apple Silicon application"
 authors = ["Grain"]
 
 [dependencies]
@@ -21,9 +21,8 @@ icon = ["assets/icons/icon.icns", "assets/icons/128x128@2x.png"]
 version = "0.3.0"
 copyright = "Copyright (c) Grain"
 category = "public.app-category.video"
-short_description = "Native Rust Video & Audio Editor"
+short_description = "Native Rust Video & Audio Editor for Apple Silicon"
 long_description = "100% Pure Rust desktop video and audio editor with native macOS VideoToolbox hardware acceleration and Rust audio DSP."
-osx_minimum_system_version = "11.0"
 
 [profile.release]
 opt-level = 3

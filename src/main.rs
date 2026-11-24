@@ -560,7 +560,7 @@ impl GrainApp {
                                 clip.brightness, clip.contrast, clip.saturation, clip.hue_deg
                             ));
                             if !clip.overlay_text.is_empty() {
-                                ui.label(format!("Overlay Text: "{}"", clip.overlay_text));
+                                ui.label(format!("Overlay Text: \"{}\"", clip.overlay_text));
                             }
                             ui.add_space(16.0);
                             ui.add(

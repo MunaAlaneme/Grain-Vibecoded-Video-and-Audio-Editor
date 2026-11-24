@@ -364,9 +364,9 @@ pub fn export_timeline(
     if !clip.overlay_text.trim().is_empty() {
         let escaped = clip
             .overlay_text
-            .replace('\', "\\")
-            .replace(':', "\:")
-            .replace(''', "\'");
+            .replace('\\', "\\\\")
+            .replace(':', "\\:")
+            .replace('\'', "\\'");
         vf_parts.push(format!(
             "drawtext=text='{}':fontcolor=white:fontsize=36:x=(w-text_w)/2:y=h-th-40:box=1:boxcolor=black@0.5:boxborderw=8",
             escaped

@@ -27,7 +27,6 @@ This produces:
 - `target/Grain-Video-Editor-macOS.dmg`
 
 
-
 Programs Used:
 Claude AI
 Grok AI
