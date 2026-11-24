@@ -1,0 +1,15 @@
+{
+  "name": "grain-video-editor",
+  "version": "0.1.0",
+  "private": true,
+  "scripts": {
+    "tauri": "node node_modules/@tauri-apps/cli/tauri.js",
+    "dev": "node node_modules/@tauri-apps/cli/tauri.js dev",
+    "build": "node node_modules/@tauri-apps/cli/tauri.js build",
+    "dev:web": "echo 'Serve frontend/ with any static server for browser testing'"
+  },
+  "devDependencies": {
+    "@tauri-apps/api": "^2.12.5",
+    "@tauri-apps/cli": "^2.12.6"
+  }
+}
