@@ -21,12 +21,13 @@ serde = { version = "1.0", features = ["derive"] }
 log = "0.4"
 tauri = { version = "2.12.7" }
 tauri-plugin-log = "2"
+tauri-plugin-dialog = "2"
+rustfft = "6.2"
+hound = "3.5"
 
-# Optional FFmpeg bindings — enable with --features ffmpeg
-# Requires system libavcodec/libavformat/libavutil (and friends) + pkg-config.
-# ffmpeg-next = { version = "7", optional = true }
+# Optional native FFmpeg bindings (brew install ffmpeg pkg-config on macOS)
+ffmpeg-next = { version = "7", optional = true }
 
 [features]
 default = []
-ffmpeg = []
-# ffmpeg = ["dep:ffmpeg-next"]
+ffmpeg = ["dep:ffmpeg-next"]

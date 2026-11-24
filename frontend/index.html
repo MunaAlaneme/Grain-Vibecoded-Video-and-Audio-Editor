@@ -2964,68 +2964,114 @@ renderTimeline();
 
 <script src="grain-bridge.js"></script>
 <script>
-// Wire export + process buttons to Rust when running inside Tauri;
-// otherwise leave the existing WebCodecs / JS DSP paths untouched.
+// 1. Fix Export tab visibility & layout
+(function fixExportTab() {
+  const exportPage = document.querySelector('.capPage[data-lib="export"]');
+  if (!exportPage) return;
+
+  // Unhide Output details panel that was hidden by the legacy Cut/Edit/Export tab switcher
+  exportPage.querySelectorAll('.hidden').forEach(el => el.classList.remove('hidden'));
+  exportPage.querySelectorAll('[data-tab]').forEach(el => {
+    el.classList.remove('hidden');
+    el.style.display = '';
+  });
+
+  const outDetails = exportPage.querySelector('details.vg');
+  if (outDetails) {
+    outDetails.open = true;
+    outDetails.style.display = 'block';
+  }
+
+  // Ensure Export button, status, and output preview are accessible inside the Export tab
+  const vrun = document.getElementById('vrun');
+  const vstatus = document.getElementById('vstatus');
+  const vout = document.getElementById('vout');
+  if (vrun && !exportPage.contains(vrun)) {
+    const wrap = document.createElement('div');
+    wrap.style.marginTop = '12px';
+    wrap.appendChild(vrun);
+    if (vstatus) wrap.appendChild(vstatus);
+    if (vout) wrap.appendChild(vout);
+    exportPage.appendChild(wrap);
+  }
+
+  // Keep button label synced with selected container & resolution
+  const syncExportLabel = () => {
+    const rb = document.getElementById('vrun');
+    if (!rb) return;
+    const cont = ((document.getElementById('ex-container') || {}).value || 'mp4').toUpperCase();
+    const res = (document.getElementById('ex-res') || {}).value || '1080';
+    const fps = (document.getElementById('ex-fps') || {}).value || '30';
+    rb.textContent = 'Export ' + cont + ' · ' + (res === '0' ? 'Source' : res + 'p') + ' · ' + fps + ' fps';
+  };
+  ['ex-container', 'ex-res', 'ex-fps', 'ex-codec'].forEach(id => {
+    const el = document.getElementById(id);
+    if (el) el.addEventListener('change', syncExportLabel);
+  });
+  syncExportLabel();
+})();
+
+// 2. Wire export + process buttons to Rust when running inside Tauri (macOS desktop);
+//    fall back to frame-accurate WebCodecs/Muxer when file paths are browser blobs.
 (function(){
   if (!window.GrainBridge) return;
 
   const origExportFast = window.exportFast;
   window.exportFast = async function(btn, vst){
     if (await GrainBridge.isTauri()) {
-      try {
-        vst.innerHTML = '<span class="spinner"></span>Exporting via Rust engine…';
-        btn.disabled = true;
-        // Minimal request built from current UI state (extend as needed)
-        const req = {
-          input_path: "timeline",
-          output_path: "export.mp4",
-          container: (document.getElementById("ex-container") || {}).value || "mp4",
-          video_codec: (document.getElementById("ex-codec") || {}).value || "h264",
-          audio_codec: (document.getElementById("ex-acodec") || {}).value || "aac",
-          video_bitrate_kbps: parseInt((document.getElementById("venc-br")||{value:8000}).value, 10) || 8000,
-          audio_bitrate_kbps: 192,
-          sample_rate: 48000,
-          hardware_encode: true,
-          hardware_decode: true
-        };
-        const result = await GrainBridge.exportVideo(req);
-        vst.textContent = result || "Rust export finished";
-      } catch(e) {
-        vst.textContent = "Rust export failed: " + (e.message || e);
-      } finally {
-        btn.disabled = false;
+      const flat = typeof flatSeq === 'function' ? flatSeq() : [];
+      const firstFile = flat[0] && flat[0].file;
+      const localInputPath = firstFile && firstFile.path ? firstFile.path : '';
+      const cont = (document.getElementById('ex-container') || {}).value || 'mp4';
+
+      // Use native Rust + FFmpeg/VideoToolbox when a local filesystem path is available and single-clip passthrough/transcode applies
+      if (localInputPath && flat.length === 1 && cont !== 'frames') {
+        try {
+          vst.innerHTML = '<span class="spinner"></span>Exporting via Rust + macOS VideoToolbox…';
+          btn.disabled = true;
+          const outPath = await GrainBridge.saveDialog('export.' + cont, [{ name: cont.toUpperCase(), extensions: [cont] }]);
+          if (!outPath) {
+            vst.textContent = 'Export cancelled.';
+            btn.disabled = false;
+            return;
+          }
+          const cfg = typeof xCfg === 'function' ? xCfg() : { w: 1920, h: 1080, fps: 30, br: 8000000, abr: 192000, hw: 'prefer-hardware' };
+          const req = {
+            input_path: localInputPath,
+            output_path: outPath,
+            container: cont,
+            video_codec: (document.getElementById('ex-codec') || {}).value || 'h264',
+            audio_codec: (document.getElementById('ex-acodec') || {}).value || 'aac',
+            video_bitrate_kbps: Math.round((cfg.br || 8000000) / 1000),
+            audio_bitrate_kbps: Math.round((cfg.abr || 192000) / 1000),
+            sample_rate: parseInt((document.getElementById('ax-sr') || { value: 48000 }).value, 10) || 48000,
+            width: cfg.w || 0,
+            height: cfg.h || 0,
+            fps: cfg.fps || 30,
+            hardware_encode: cfg.hw !== 'prefer-software',
+            hardware_decode: true
+          };
+          const result = await GrainBridge.exportVideo(req);
+          vst.textContent = result || 'Rust export finished.';
+          btn.disabled = false;
+          return;
+        } catch(e) {
+          if (String(e).includes('NO_LOCAL_PATH')) {
+            // Fall through to frame-accurate renderer
+          } else {
+            vst.textContent = 'Rust export failed: ' + (e.message || e);
+            btn.disabled = false;
+            return;
+          }
+        }
       }
-      return;
     }
-    // Browser path
-    if (typeof origExportFast === "function") return origExportFast(btn, vst);
+    // Frame-accurate WebCodecs / GrainMux path (works in both Tauri WebKit & Browser)
+    if (typeof origExportFast === 'function') return origExportFast(btn, vst);
   };
 
-  // Audio Process button
-  const runBtn = document.getElementById("run");
-  if (runBtn) {
-    const origClick = runBtn.onclick;
-    runBtn.addEventListener("click", async (ev) => {
-      if (await GrainBridge.isTauri()) {
-        ev.stopImmediatePropagation();
-        const status = document.getElementById("status");
-        if (status) status.textContent = "Processing via Rust…";
-        try {
-          const req = { input_path: "loaded-audio", effect: "pitch", params: {} };
-          const result = await GrainBridge.processAudio(req);
-          if (status) status.textContent = result || "Rust audio processing finished";
-        } catch(e) {
-          if (status) status.textContent = "Rust audio failed: " + e.message;
-        }
-        return;
-      }
-      // else let original handler run
-    }, true);
-  }
-
-  console.log("[Grain] bridge loaded —", window.__TAURI_INTERNALS__ ? "desktop" : "browser");
+  console.log('[Grain] bridge loaded —', window.__TAURI_INTERNALS__ ? 'desktop (macOS/Rust)' : 'browser');
 })();
 </script>
-
 </body>
 </html>
