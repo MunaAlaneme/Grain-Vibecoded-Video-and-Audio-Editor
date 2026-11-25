@@ -1,0 +1,9 @@
+********************************************************************************
+START mainEntry (OfxActionLoad for com.redgiant.magicbullet.looks20264)
+    ERROR : Could not fetch the mandatory suite 'OfxImageEffectSuite' version 1.
+    ERROR : Caught OFX::Exception::HostInadequate: OfxImageEffectSuite
+STOP mainEntry (OfxActionLoad for com.redgiant.magicbullet.looks20264, returning 4=kOfxStatErrMissingHostFeature)
+
+********************************************************************************
+START mainEntry (OfxActionLoad for com.redgiant.magicbullet.looks20264)
+    START validating properties of Host Property.

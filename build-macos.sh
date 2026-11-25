@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-echo "=== Grain Video & Audio Editor — Pure Rust macOS M3 (aarch64-apple-darwin) Build ==="
+echo "=== Grain Video & Audio Studio — 100% Pure Rust macOS M3 (aarch64-apple-darwin) Build ==="
 
 if ! command -v cargo >/dev/null 2>&1; then
   echo "Error: Rust is not installed. Install via: curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh"

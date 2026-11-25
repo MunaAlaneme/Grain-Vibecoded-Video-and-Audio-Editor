@@ -1,15 +1,15 @@
-use crate::audio_dsp::{process_channel, AudioDspParams};
-use serde::{Deserialize, Serialize};
+use crate::audio_dsp::{process_stereo, AudioExportFormat, AudioLabState};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ContainerFormat {
     Mp4,
     Mov,
     Mkv,
     Webm,
     Avi,
+    FramesZip,
 }
 
 impl ContainerFormat {
@@ -19,6 +19,7 @@ impl ContainerFormat {
         ContainerFormat::Mkv,
         ContainerFormat::Webm,
         ContainerFormat::Avi,
+        ContainerFormat::FramesZip,
     ];
 
     pub fn ext(&self) -> &'static str {
@@ -28,6 +29,7 @@ impl ContainerFormat {
             ContainerFormat::Mkv => "mkv",
             ContainerFormat::Webm => "webm",
             ContainerFormat::Avi => "avi",
+            ContainerFormat::FramesZip => "zip",
         }
     }
 
@@ -38,11 +40,12 @@ impl ContainerFormat {
             ContainerFormat::Mkv => "Matroska (.mkv)",
             ContainerFormat::Webm => "WebM (.webm)",
             ContainerFormat::Avi => "AVI (.avi)",
+            ContainerFormat::FramesZip => "Image Frames (JPEG sequence)",
         }
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum VideoCodec {
     H264,
     Hevc,
@@ -65,37 +68,34 @@ impl VideoCodec {
             VideoCodec::H264 => "H.264 / AVC",
             VideoCodec::Hevc => "H.265 / HEVC",
             VideoCodec::Av1 => "AV1",
-            VideoCodec::Vp9 => "VP9",
-            VideoCodec::Mjpeg => "MJPEG",
+            VideoCodec::Vp9 => "VP9 (WebM, MKV)",
+            VideoCodec::Mjpeg => "MJPEG (AVI)",
         }
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub enum AudioCodec {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VideoAudioCodec {
     Aac,
     Opus,
-    Flac,
-    Pcm24,
+    Pcm,
     None,
 }
 
-impl AudioCodec {
-    pub const ALL: &'static [AudioCodec] = &[
-        AudioCodec::Aac,
-        AudioCodec::Opus,
-        AudioCodec::Flac,
-        AudioCodec::Pcm24,
-        AudioCodec::None,
+impl VideoAudioCodec {
+    pub const ALL: &'static [VideoAudioCodec] = &[
+        VideoAudioCodec::Aac,
+        VideoAudioCodec::Opus,
+        VideoAudioCodec::Pcm,
+        VideoAudioCodec::None,
     ];
 
     pub fn label(&self) -> &'static str {
         match self {
-            AudioCodec::Aac => "AAC-LC",
-            AudioCodec::Opus => "Opus",
-            AudioCodec::Flac => "FLAC (Lossless)",
-            AudioCodec::Pcm24 => "PCM 24-bit",
-            AudioCodec::None => "No Audio",
+            VideoAudioCodec::Aac => "AAC-LC",
+            VideoAudioCodec::Opus => "Opus",
+            VideoAudioCodec::Pcm => "PCM (MKV, AVI)",
+            VideoAudioCodec::None => "No audio",
         }
     }
 }
@@ -108,6 +108,7 @@ pub enum ResolutionPreset {
     P1080,
     P1440,
     P2160,
+    P4320,
 }
 
 impl ResolutionPreset {
@@ -118,16 +119,18 @@ impl ResolutionPreset {
         ResolutionPreset::P1080,
         ResolutionPreset::P1440,
         ResolutionPreset::P2160,
+        ResolutionPreset::P4320,
     ];
 
     pub fn label(&self) -> &'static str {
         match self {
-            ResolutionPreset::Source => "Source (Original)",
-            ResolutionPreset::P480 => "480p SD",
-            ResolutionPreset::P720 => "720p HD",
+            ResolutionPreset::Source => "Source (Adapted)",
+            ResolutionPreset::P480 => "480p",
+            ResolutionPreset::P720 => "720p",
             ResolutionPreset::P1080 => "1080p Full HD",
             ResolutionPreset::P1440 => "1440p 2K",
-            ResolutionPreset::P2160 => "2160p 4K UHD",
+            ResolutionPreset::P2160 => "2160p 4K",
+            ResolutionPreset::P4320 => "4320p 8K",
         }
     }
 
@@ -139,6 +142,655 @@ impl ResolutionPreset {
             ResolutionPreset::P1080 => Some(1080),
             ResolutionPreset::P1440 => Some(1440),
             ResolutionPreset::P2160 => Some(2160),
+            ResolutionPreset::P4320 => Some(4320),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AspectRatioPreset {
+    Original,
+    R16x9,
+    R9x16,
+    R1x1,
+    R4x5,
+    R4x3,
+    R21x9,
+}
+
+impl AspectRatioPreset {
+    pub const ALL: &'static [AspectRatioPreset] = &[
+        AspectRatioPreset::Original,
+        AspectRatioPreset::R16x9,
+        AspectRatioPreset::R9x16,
+        AspectRatioPreset::R1x1,
+        AspectRatioPreset::R4x5,
+        AspectRatioPreset::R4x3,
+        AspectRatioPreset::R21x9,
+    ];
+
+    pub fn label(&self) -> &'static str {
+        match self {
+            AspectRatioPreset::Original => "Original",
+            AspectRatioPreset::R16x9 => "16:9",
+            AspectRatioPreset::R9x16 => "9:16 (vertical)",
+            AspectRatioPreset::R1x1 => "1:1 (square)",
+            AspectRatioPreset::R4x5 => "4:5",
+            AspectRatioPreset::R4x3 => "4:3",
+            AspectRatioPreset::R21x9 => "21:9",
+        }
+    }
+
+    pub fn ratio(&self) -> Option<f32> {
+        match self {
+            AspectRatioPreset::Original => None,
+            AspectRatioPreset::R16x9 => Some(16.0 / 9.0),
+            AspectRatioPreset::R9x16 => Some(9.0 / 16.0),
+            AspectRatioPreset::R1x1 => Some(1.0),
+            AspectRatioPreset::R4x5 => Some(4.0 / 5.0),
+            AspectRatioPreset::R4x3 => Some(4.0 / 3.0),
+            AspectRatioPreset::R21x9 => Some(21.0 / 9.0),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FramingMode {
+    FitLetterbox,
+    FillCrop,
+}
+
+impl FramingMode {
+    pub fn label(&self) -> &'static str {
+        match self {
+            FramingMode::FitLetterbox => "Fit (letterbox)",
+            FramingMode::FillCrop => "Fill (crop)",
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct ProjectSettings {
+    pub name: String,
+    pub color_space: String,
+    pub aspect: AspectRatioPreset,
+    pub framing: FramingMode,
+}
+
+impl Default for ProjectSettings {
+    fn default() -> Self {
+        Self {
+            name: "Untitled".into(),
+            color_space: "Rec. 709 SDR".into(),
+            aspect: AspectRatioPreset::Original,
+            framing: FramingMode::FitLetterbox,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EasingCurve {
+    Linear,
+    InQuad,
+    OutQuad,
+    InOutQuad,
+    InCubic,
+    OutCubic,
+    InOutCubic,
+    InSine,
+    OutSine,
+    InOutSine,
+    InExpo,
+    OutExpo,
+    Hold,
+}
+
+impl EasingCurve {
+    pub const ALL: &'static [EasingCurve] = &[
+        EasingCurve::Linear,
+        EasingCurve::InQuad,
+        EasingCurve::OutQuad,
+        EasingCurve::InOutQuad,
+        EasingCurve::InCubic,
+        EasingCurve::OutCubic,
+        EasingCurve::InOutCubic,
+        EasingCurve::InSine,
+        EasingCurve::OutSine,
+        EasingCurve::InOutSine,
+        EasingCurve::InExpo,
+        EasingCurve::OutExpo,
+        EasingCurve::Hold,
+    ];
+
+    pub fn label(&self) -> &'static str {
+        match self {
+            EasingCurve::Linear => "Linear",
+            EasingCurve::InQuad => "Ease in (quad)",
+            EasingCurve::OutQuad => "Ease out (quad)",
+            EasingCurve::InOutQuad => "Ease in-out (quad)",
+            EasingCurve::InCubic => "Ease in (cubic)",
+            EasingCurve::OutCubic => "Ease out (cubic)",
+            EasingCurve::InOutCubic => "Ease in-out (cubic)",
+            EasingCurve::InSine => "Sine in",
+            EasingCurve::OutSine => "Sine out",
+            EasingCurve::InOutSine => "Sine in-out",
+            EasingCurve::InExpo => "Expo in",
+            EasingCurve::OutExpo => "Expo out",
+            EasingCurve::Hold => "Hold (step)",
+        }
+    }
+
+    pub fn eval(&self, t: f32) -> f32 {
+        let t = t.clamp(0.0, 1.0);
+        match self {
+            EasingCurve::Linear => t,
+            EasingCurve::InQuad => t * t,
+            EasingCurve::OutQuad => t * (2.0 - t),
+            EasingCurve::InOutQuad => {
+                if t < 0.5 {
+                    2.0 * t * t
+                } else {
+                    -1.0 + (4.0 - 2.0 * t) * t
+                }
+            }
+            EasingCurve::InCubic => t * t * t,
+            EasingCurve::OutCubic => {
+                let u = t - 1.0;
+                u * u * u + 1.0
+            }
+            EasingCurve::InOutCubic => {
+                if t < 0.5 {
+                    4.0 * t * t * t
+                } else {
+                    (t - 1.0) * (2.0 * t - 2.0) * (2.0 * t - 2.0) + 1.0
+                }
+            }
+            EasingCurve::InSine => 1.0 - (t * std::f32::consts::FRAC_PI_2).cos(),
+            EasingCurve::OutSine => (t * std::f32::consts::FRAC_PI_2).sin(),
+            EasingCurve::InOutSine => -((std::f32::consts::PI * t).cos() - 1.0) * 0.5,
+            EasingCurve::InExpo => {
+                if t == 0.0 {
+                    0.0
+                } else {
+                    2.0_f32.powf(10.0 * t - 10.0)
+                }
+            }
+            EasingCurve::OutExpo => {
+                if t == 1.0 {
+                    1.0
+                } else {
+                    1.0 - 2.0_f32.powf(-10.0 * t)
+                }
+            }
+            EasingCurve::Hold => 0.0,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct VideoKeyframe {
+    pub time_sec: f64,
+    pub easing: EasingCurve,
+    pub brightness: f32,
+    pub contrast: f32,
+    pub saturation: f32,
+    pub hue: f32,
+    pub blur: f32,
+    pub zoom: f32,
+    pub rotate: f32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VideoLook {
+    None,
+    Grayscale,
+    Sepia,
+    Invert,
+    CrossProcess,
+    Cyanotype,
+    NightVision,
+    Vintage,
+}
+
+impl VideoLook {
+    pub const ALL: &'static [VideoLook] = &[
+        VideoLook::None,
+        VideoLook::Grayscale,
+        VideoLook::Sepia,
+        VideoLook::Invert,
+        VideoLook::CrossProcess,
+        VideoLook::Cyanotype,
+        VideoLook::NightVision,
+        VideoLook::Vintage,
+    ];
+
+    pub fn label(&self) -> &'static str {
+        match self {
+            VideoLook::None => "None",
+            VideoLook::Grayscale => "Grayscale",
+            VideoLook::Sepia => "Sepia",
+            VideoLook::Invert => "Invert",
+            VideoLook::CrossProcess => "Cross-process",
+            VideoLook::Cyanotype => "Cyanotype",
+            VideoLook::NightVision => "Night vision",
+            VideoLook::Vintage => "Vintage",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TransitionType {
+    None,
+    FadeBlack,
+    Wipe,
+    Slide,
+    Zoom,
+    S_DissolveGlow,
+    S_DissolveLensFlare,
+    S_DissolveUltraGlow,
+    S_FilmRoll,
+    S_SwishPan,
+    S_HyperPull,
+}
+
+impl TransitionType {
+    pub const ALL: &'static [TransitionType] = &[
+        TransitionType::None,
+        TransitionType::FadeBlack,
+        TransitionType::Wipe,
+        TransitionType::Slide,
+        TransitionType::Zoom,
+        TransitionType::S_DissolveGlow,
+        TransitionType::S_DissolveLensFlare,
+        TransitionType::S_DissolveUltraGlow,
+        TransitionType::S_FilmRoll,
+        TransitionType::S_SwishPan,
+        TransitionType::S_HyperPull,
+    ];
+
+    pub fn label(&self) -> &'static str {
+        match self {
+            TransitionType::None => "None",
+            TransitionType::FadeBlack => "Fade through black",
+            TransitionType::Wipe => "Wipe",
+            TransitionType::Slide => "Slide",
+            TransitionType::Zoom => "Zoom",
+            TransitionType::S_DissolveGlow => "S_DissolveGlow (Sapphire)",
+            TransitionType::S_DissolveLensFlare => "S_DissolveLensFlare (Sapphire)",
+            TransitionType::S_DissolveUltraGlow => "S_DissolveUltraGlow (Sapphire)",
+            TransitionType::S_FilmRoll => "S_FilmRoll (Sapphire)",
+            TransitionType::S_SwishPan => "S_SwishPan (Sapphire)",
+            TransitionType::S_HyperPull => "S_HyperPull (Sapphire)",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MaskType {
+    None,
+    Ellipse,
+    Rectangle,
+    LinearGradient,
+}
+
+impl MaskType {
+    pub const ALL: &'static [MaskType] = &[
+        MaskType::None,
+        MaskType::Ellipse,
+        MaskType::Rectangle,
+        MaskType::LinearGradient,
+    ];
+
+    pub fn label(&self) -> &'static str {
+        match self {
+            MaskType::None => "None",
+            MaskType::Ellipse => "Ellipse",
+            MaskType::Rectangle => "Rectangle",
+            MaskType::LinearGradient => "Linear gradient",
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct TextOverlayItem {
+    pub text: String,
+    pub size_pct: f32,
+    pub x_pct: f32,
+    pub y_pct: f32,
+    pub start_sec: f64,
+    pub end_sec: f64,
+    pub color: [u8; 3],
+}
+
+#[derive(Debug, Clone)]
+pub struct OverlayTrackItem {
+    pub path: PathBuf,
+    pub name: String,
+    pub duration_sec: f64,
+    pub start_sec: f64,
+    pub x_pct: f32,
+    pub y_pct: f32,
+    pub size_pct: f32,
+    pub opacity_pct: f32,
+}
+
+#[derive(Debug, Clone)]
+pub struct MusicTrackItem {
+    pub path: PathBuf,
+    pub name: String,
+    pub duration_sec: f64,
+    pub in_sec: f64,
+    pub start_sec: f64,
+    pub volume_pct: f32,
+}
+
+#[derive(Debug, Clone)]
+pub struct VideoFxParams {
+    // Adjust / Basic & Color
+    pub brightness: f32,       // 0..200% (100 default)
+    pub contrast: f32,         // 0..200% (100 default)
+    pub saturation: f32,       // 0..300% (100 default)
+    pub hue_deg: f32,          // 0..360°
+    pub temperature: f32,      // -100..100
+    pub tint: f32,             // -100..100
+    pub look: VideoLook,
+    pub wheel_shadows: [f32; 2],
+    pub wheel_midtones: [f32; 2],
+    pub wheel_highlights: [f32; 2],
+    pub curves_rgb_mid: [f32; 2],
+    pub hsl_hue_shift: f32,
+    pub hsl_sat_shift: f32,
+    pub hsl_lum_shift: f32,
+    // Transitions
+    pub transition: TransitionType,
+    pub transition_dur: f32,
+    // Core Effects
+    pub blur_px: f32,
+    pub vignette: f32,
+    pub film_grain: f32,
+    pub scanlines: f32,
+    pub pixelate: f32,
+    pub glitch: f32,
+    pub posterize: f32,
+    pub rgb_split: f32,
+    pub kaleidoscope: u32,
+    pub camera_shake: f32,
+    pub motion_trail: f32,
+    // Mask
+    pub mask_type: MaskType,
+    pub mask_x: f32,
+    pub mask_y: f32,
+    pub mask_size: f32,
+    pub mask_feather: f32,
+    pub mask_invert: bool,
+    // Light / Stylize / Transform
+    pub glow: f32,
+    pub light_leak: f32,
+    pub strobe: f32,
+    pub tilt_shift: f32,
+    pub sharpen: f32,
+    pub duotone: f32,
+    pub zoom_blur: f32,
+    pub zoom_pct: f32,         // 100..250%
+    pub rotate_deg: f32,       // -180..180
+    pub flip_h: bool,
+    pub flip_v: bool,
+    pub mirror_mode: String,
+    pub letterbox: f32,
+    // Print & Neon
+    pub halftone_px: f32,
+    pub neon_edges: f32,
+    pub ripple_rings: f32,
+    // Color FX
+    pub solarize: f32,
+    pub threshold_bw: f32,
+    pub bleach_bypass: f32,
+    pub channel_swap: String,
+    // Hue Cycle, Tile, Spotlight
+    pub hue_cycle_speed: f32,
+    pub tile_repeat: u32,
+    pub spotlight_dark: f32,
+    pub spotlight_radius: f32,
+    // BorisFX Sapphire S_ Suite (40+ effects)
+    pub waves_enabled: bool,
+    pub wave_a_amp: f32,
+    pub wave_a_freq: f32,
+    pub wave_b_amp: f32,
+    pub wave_b_freq: f32,
+    pub perspective_enabled: bool,
+    pub persp_lat: f32,
+    pub persp_swing: f32,
+    pub persp_roll: f32,
+    pub cube_rot_deg: f32,
+    pub s_fisheye: f32,
+    pub s_magnify: f32,
+    pub s_polar: bool,
+    pub s_bubble2: f32,
+    pub s_vortex: f32,
+    pub s_warp_chroma: f32,
+    pub s_warp_puddle: f32,
+    pub s_warp_transform_rot: f32,
+    pub s_blur_dir: f32,
+    pub s_blur_rad: f32,
+    pub s_blur_motion: f32,
+    pub s_rack_defocus: f32,
+    pub s_z_blur: f32,
+    pub s_edge_blur: f32,
+    pub s_beauty: f32,
+    pub s_glow: f32,
+    pub s_glow_noise: f32,
+    pub s_glow_rainbow: f32,
+    pub s_glow_orthicon: f32,
+    pub s_halation: f32,
+    pub s_glare: f32,
+    pub s_glint: f32,
+    pub s_sparkle: f32,
+    pub s_flashbulb: f32,
+    pub s_rays: f32,
+    pub s_streaks: f32,
+    pub s_lens_flare: f32,
+    pub s_edge_rays: f32,
+    pub s_light_leak: f32,
+    pub s_quadtone: f32,
+    pub s_multitone: f32,
+    pub s_tritone: f32,
+    pub s_zebrafy: f32,
+    pub s_pixel_sort: f32,
+    pub s_warp_puff: f32,
+    pub s_emboss_distort: f32,
+    pub s_emboss_shiny: f32,
+    pub s_zap: f32,
+    pub s_aurora: f32,
+    pub s_caustics: f32,
+    pub s_clouds: f32,
+    pub s_texture_cells: f32,
+    pub s_auto_paint: f32,
+    pub s_cartoon: f32,
+    pub s_etching: f32,
+    pub s_scanlines: f32,
+    pub s_film_damage: f32,
+    pub s_shake: f32,
+    pub s_psyko_stripes: bool,
+    pub s_psyko_blobs: bool,
+    // Red Giant Universe style
+    pub u_chromatic_glow: f32,
+    pub u_edge_glow: f32,
+    pub u_starglow: f32,
+    pub u_holomatrix: f32,
+    pub u_rgb_sep: f32,
+    pub u_heatwave: f32,
+    pub u_glitch: f32,
+    pub u_noir: f32,
+    pub u_retrograde: f32,
+    // Boris Continuum style
+    pub bcc_film_grain: f32,
+    pub bcc_film_damage: f32,
+    pub bcc_vignette: f32,
+    pub bcc_glow: f32,
+    pub bcc_lightning: f32,
+    pub bcc_laser: f32,
+    pub bcc_halftone: f32,
+    pub bcc_pencil: f32,
+    pub bcc_mosaic: f32,
+    pub bcc_median: u32,
+    pub bcc_falsecolor: f32,
+    // TV Simulator (CRT)
+    pub crt_enabled: bool,
+    pub crt_curvature: f32,
+    pub crt_scanlines: f32,
+    pub crt_phosphor: f32,
+    pub crt_bloom: f32,
+    pub crt_bleed: f32,
+    pub crt_noise: f32,
+}
+
+impl Default for VideoFxParams {
+    fn default() -> Self {
+        Self {
+            brightness: 100.0,
+            contrast: 100.0,
+            saturation: 100.0,
+            hue_deg: 0.0,
+            temperature: 0.0,
+            tint: 0.0,
+            look: VideoLook::None,
+            wheel_shadows: [0.0, 0.0],
+            wheel_midtones: [0.0, 0.0],
+            wheel_highlights: [0.0, 0.0],
+            curves_rgb_mid: [0.5, 0.5],
+            hsl_hue_shift: 0.0,
+            hsl_sat_shift: 0.0,
+            hsl_lum_shift: 0.0,
+            transition: TransitionType::None,
+            transition_dur: 0.8,
+            blur_px: 0.0,
+            vignette: 0.0,
+            film_grain: 0.0,
+            scanlines: 0.0,
+            pixelate: 0.0,
+            glitch: 0.0,
+            posterize: 0.0,
+            rgb_split: 0.0,
+            kaleidoscope: 0,
+            camera_shake: 0.0,
+            motion_trail: 0.0,
+            mask_type: MaskType::None,
+            mask_x: 50.0,
+            mask_y: 50.0,
+            mask_size: 60.0,
+            mask_feather: 20.0,
+            mask_invert: false,
+            glow: 0.0,
+            light_leak: 0.0,
+            strobe: 0.0,
+            tilt_shift: 0.0,
+            sharpen: 0.0,
+            duotone: 0.0,
+            zoom_blur: 0.0,
+            zoom_pct: 100.0,
+            rotate_deg: 0.0,
+            flip_h: false,
+            flip_v: false,
+            mirror_mode: "None".into(),
+            letterbox: 0.0,
+            halftone_px: 0.0,
+            neon_edges: 0.0,
+            ripple_rings: 0.0,
+            solarize: 0.0,
+            threshold_bw: 0.0,
+            bleach_bypass: 0.0,
+            channel_swap: "None".into(),
+            hue_cycle_speed: 0.0,
+            tile_repeat: 1,
+            spotlight_dark: 0.0,
+            spotlight_radius: 40.0,
+            waves_enabled: false,
+            wave_a_amp: 0.0,
+            wave_a_freq: 6.0,
+            wave_b_amp: 0.0,
+            wave_b_freq: 3.0,
+            perspective_enabled: false,
+            persp_lat: 35.0,
+            persp_swing: 0.0,
+            persp_roll: 0.0,
+            cube_rot_deg: 0.0,
+            s_fisheye: 0.0,
+            s_magnify: 0.0,
+            s_polar: false,
+            s_bubble2: 0.0,
+            s_vortex: 0.0,
+            s_warp_chroma: 0.0,
+            s_warp_puddle: 0.0,
+            s_warp_transform_rot: 0.0,
+            s_blur_dir: 0.0,
+            s_blur_rad: 0.0,
+            s_blur_motion: 0.0,
+            s_rack_defocus: 0.0,
+            s_z_blur: 0.0,
+            s_edge_blur: 0.0,
+            s_beauty: 0.0,
+            s_glow: 0.0,
+            s_glow_noise: 0.0,
+            s_glow_rainbow: 0.0,
+            s_glow_orthicon: 0.0,
+            s_halation: 0.0,
+            s_glare: 0.0,
+            s_glint: 0.0,
+            s_sparkle: 0.0,
+            s_flashbulb: 0.0,
+            s_rays: 0.0,
+            s_streaks: 0.0,
+            s_lens_flare: 0.0,
+            s_edge_rays: 0.0,
+            s_light_leak: 0.0,
+            s_quadtone: 0.0,
+            s_multitone: 0.0,
+            s_tritone: 0.0,
+            s_zebrafy: 0.0,
+            s_pixel_sort: 0.0,
+            s_warp_puff: 0.0,
+            s_emboss_distort: 0.0,
+            s_emboss_shiny: 0.0,
+            s_zap: 0.0,
+            s_aurora: 0.0,
+            s_caustics: 0.0,
+            s_clouds: 0.0,
+            s_texture_cells: 0.0,
+            s_auto_paint: 0.0,
+            s_cartoon: 0.0,
+            s_etching: 0.0,
+            s_scanlines: 0.0,
+            s_film_damage: 0.0,
+            s_shake: 0.0,
+            s_psyko_stripes: false,
+            s_psyko_blobs: false,
+            u_chromatic_glow: 0.0,
+            u_edge_glow: 0.0,
+            u_starglow: 0.0,
+            u_holomatrix: 0.0,
+            u_rgb_sep: 0.0,
+            u_heatwave: 0.0,
+            u_glitch: 0.0,
+            u_noir: 0.0,
+            u_retrograde: 0.0,
+            bcc_film_grain: 0.0,
+            bcc_film_damage: 0.0,
+            bcc_vignette: 0.0,
+            bcc_glow: 0.0,
+            bcc_lightning: 0.0,
+            bcc_laser: 0.0,
+            bcc_halftone: 0.0,
+            bcc_pencil: 0.0,
+            bcc_mosaic: 0.0,
+            bcc_median: 0,
+            bcc_falsecolor: 0.0,
+            crt_enabled: false,
+            crt_curvature: 0.5,
+            crt_scanlines: 0.5,
+            crt_phosphor: 0.35,
+            crt_bloom: 0.4,
+            crt_bleed: 2.0,
+            crt_noise: 0.12,
         }
     }
 }
@@ -151,17 +803,8 @@ pub struct TimelineClip {
     pub trim_start_sec: f64,
     pub trim_end_sec: f64,
     pub speed: f32,
-    pub brightness: f32,   // -1.0 to 1.0 (0.0 default)
-    pub contrast: f32,     // 0.0 to 2.0 (1.0 default)
-    pub saturation: f32,   // 0.0 to 3.0 (1.0 default)
-    pub hue_deg: f32,      // -180.0 to 180.0
-    pub blur: f32,         // 0.0 to 10.0
-    pub grayscale: bool,
-    pub sepia: bool,
-    pub invert: bool,
-    pub mirror_h: bool,
-    pub mirror_v: bool,
-    pub overlay_text: String,
+    pub is_compound: bool,
+    pub fx: VideoFxParams,
 }
 
 impl TimelineClip {
@@ -172,37 +815,41 @@ impl TimelineClip {
 }
 
 #[derive(Debug, Clone)]
-pub struct ExportSettings {
+pub struct VideoExportSettings {
     pub container: ContainerFormat,
     pub video_codec: VideoCodec,
-    pub audio_codec: AudioCodec,
+    pub audio_codec: VideoAudioCodec,
     pub resolution: ResolutionPreset,
     pub fps: u32,
-    pub video_bitrate_kbps: u32,
+    pub auto_bitrate: bool,
+    pub video_bitrate_mbps: u32,
     pub audio_bitrate_kbps: u32,
-    pub sample_rate: u32,
     pub hardware_encode: bool,
-    pub hardware_decode: bool,
+    pub also_export_pcm_wav: bool,
+    pub audio_only_format: AudioExportFormat,
+    pub audio_only_sr: u32,
 }
 
-impl Default for ExportSettings {
+impl Default for VideoExportSettings {
     fn default() -> Self {
         Self {
             container: ContainerFormat::Mp4,
             video_codec: VideoCodec::H264,
-            audio_codec: AudioCodec::Aac,
+            audio_codec: VideoAudioCodec::Aac,
             resolution: ResolutionPreset::P1080,
             fps: 30,
-            video_bitrate_kbps: 10_000,
+            auto_bitrate: true,
+            video_bitrate_mbps: 12,
             audio_bitrate_kbps: 192,
-            sample_rate: 48_000,
             hardware_encode: true,
-            hardware_decode: true,
+            also_export_pcm_wav: false,
+            audio_only_format: AudioExportFormat::Wav24,
+            audio_only_sr: 48_000,
         }
     }
 }
 
-pub fn check_ffmpeg_available() -> bool {
+pub fn check_ffmpeg() -> bool {
     Command::new("ffmpeg")
         .arg("-version")
         .output()
@@ -210,73 +857,140 @@ pub fn check_ffmpeg_available() -> bool {
         .unwrap_or(false)
 }
 
-pub fn probe_duration(path: &Path) -> f64 {
+pub fn probe_media_info(path: &Path) -> (f64, u32, u32) {
     let out = Command::new("ffprobe")
         .args([
             "-v",
             "error",
+            "-select_streams",
+            "v:0",
             "-show_entries",
-            "format=duration",
+            "stream=width,height:format=duration",
             "-of",
             "default=noprint_wrappers=1:nokey=1",
         ])
         .arg(path)
         .output();
 
+    let mut dur = 10.0;
+    let mut w = 1920u32;
+    let mut h = 1080u32;
+
     if let Ok(o) = out {
         if o.status.success() {
             if let Ok(s) = String::from_utf8(o.stdout) {
-                if let Ok(d) = s.trim().parse::<f64>() {
-                    if d.is_finite() && d > 0.0 {
-                        return d;
+                let nums: Vec<&str> = s.lines().map(str::trim).filter(|l| !l.is_empty()).collect();
+                for line in nums {
+                    if let Ok(iv) = line.parse::<u32>() {
+                        if w == 1920 && iv > 64 {
+                            w = iv;
+                        } else if iv > 64 {
+                            h = iv;
+                        }
+                    } else if let Ok(fv) = line.parse::<f64>() {
+                        if fv.is_finite() && fv > 0.0 {
+                            dur = fv;
+                        }
                     }
                 }
             }
         }
     }
-    10.0
+    (dur, w, h)
 }
 
-pub fn validate_export_combo(settings: &ExportSettings) -> Result<(), String> {
-    match settings.container {
-        ContainerFormat::Webm => {
-            if !matches!(settings.video_codec, VideoCodec::Vp9 | VideoCodec::Av1) {
-                return Err("WebM requires VP9 or AV1 video codec.".into());
+pub fn validate_video_export(s: &VideoExportSettings) -> Result<(), String> {
+    match s.container {
+        ContainerFormat::Avi => {
+            if s.video_codec != VideoCodec::Mjpeg {
+                return Err("AVI carries MJPEG video: select MJPEG.".into());
             }
-            if !matches!(settings.audio_codec, AudioCodec::Opus | AudioCodec::None) {
-                return Err("WebM requires Opus or No Audio.".into());
+            if !matches!(s.audio_codec, VideoAudioCodec::Pcm | VideoAudioCodec::None) {
+                return Err("AVI carries PCM audio: pick PCM or No audio.".into());
             }
         }
-        ContainerFormat::Avi => {
-            if settings.video_codec != VideoCodec::Mjpeg {
-                return Err("AVI requires MJPEG video codec.".into());
+        ContainerFormat::Mkv => {
+            if s.video_codec == VideoCodec::Mjpeg {
+                return Err("Matroska needs H.264, HEVC, AV1 or VP9 video.".into());
             }
-            if !matches!(settings.audio_codec, AudioCodec::Pcm24 | AudioCodec::None) {
-                return Err("AVI requires PCM or No Audio.".into());
+        }
+        ContainerFormat::Webm => {
+            if !matches!(s.video_codec, VideoCodec::Vp9 | VideoCodec::Av1) {
+                return Err("WebM needs VP9 or AV1 video.".into());
+            }
+            if !matches!(s.audio_codec, VideoAudioCodec::Opus | VideoAudioCodec::None) {
+                return Err("WebM uses Opus audio.".into());
             }
         }
         ContainerFormat::Mp4 | ContainerFormat::Mov => {
-            if matches!(settings.video_codec, VideoCodec::Mjpeg | VideoCodec::Vp9) {
-                return Err("MP4 / MOV requires H.264, HEVC, or AV1 video.".into());
+            if !matches!(
+                s.video_codec,
+                VideoCodec::H264 | VideoCodec::Hevc | VideoCodec::Av1
+            ) {
+                return Err("MP4 and MOV need H.264, HEVC or AV1 video.".into());
             }
-            if settings.audio_codec == AudioCodec::Pcm24 {
-                return Err("Use MKV or AVI for uncompressed PCM audio.".into());
+            if s.audio_codec == VideoAudioCodec::Pcm {
+                return Err("PCM goes in MKV or AVI, not MP4 or MOV.".into());
             }
         }
-        ContainerFormat::Mkv => {}
+        ContainerFormat::FramesZip => {}
     }
     Ok(())
 }
 
-pub fn export_timeline(
+pub fn export_video_sequence(
     clips: &[TimelineClip],
+    texts: &[TextOverlayItem],
+    project: &ProjectSettings,
+    settings: &VideoExportSettings,
     output_path: &Path,
-    settings: &ExportSettings,
 ) -> Result<String, String> {
     if clips.is_empty() {
-        return Err("Add at least one clip to the timeline before exporting.".into());
+        return Err("Add at least one clip first.".into());
     }
-    validate_export_combo(settings)?;
+    validate_video_export(settings)?;
+
+    if settings.container == ContainerFormat::FramesZip {
+        let temp_dir = std::env::temp_dir().join("grain_frames_export");
+        let _ = std::fs::remove_dir_all(&temp_dir);
+        std::fs::create_dir_all(&temp_dir).map_err(|e| e.to_string())?;
+        let clip = &clips[0];
+        let frame_pattern = temp_dir.join("frame_%06d.jpg");
+        let status = Command::new("ffmpeg")
+            .args([
+                "-y",
+                "-ss",
+                &format!("{:.3}", clip.trim_start_sec),
+                "-to",
+                &format!("{:.3}", clip.trim_end_sec),
+                "-i",
+            ])
+            .arg(&clip.path)
+            .args(["-r", &settings.fps.to_string(), "-q:v", "2"])
+            .arg(&frame_pattern)
+            .output()
+            .map_err(|e| format!("FFmpeg failed: {}", e))?;
+        if !status.status.success() {
+            return Err(String::from_utf8_lossy(&status.stderr).to_string());
+        }
+        let zip_res = Command::new("zip")
+            .args(["-j", "-q"])
+            .arg(output_path)
+            .arg(temp_dir.join("*.jpg"))
+            .output();
+        if zip_res.is_err() {
+            let py = format!(
+                "import zipfile, glob, os; z=zipfile.ZipFile(r'{}','w'); [z.write(f, os.path.basename(f)) for f in sorted(glob.glob(r'{}/*.jpg'))]; z.close()",
+                output_path.display(),
+                temp_dir.display()
+            );
+            let _ = Command::new("python3").args(["-c", &py]).output();
+        }
+        return Ok(format!(
+            "Exported JPEG Frame Sequence ZIP → {}",
+            output_path.display()
+        ));
+    }
 
     let vcodec = match settings.video_codec {
         VideoCodec::H264 => {
@@ -299,21 +1013,18 @@ pub fn export_timeline(
     };
 
     let acodec = match settings.audio_codec {
-        AudioCodec::Aac => "aac",
-        AudioCodec::Opus => "libopus",
-        AudioCodec::Flac => "flac",
-        AudioCodec::Pcm24 => "pcm_s24le",
-        AudioCodec::None => "none",
+        VideoAudioCodec::Aac => "aac",
+        VideoAudioCodec::Opus => "libopus",
+        VideoAudioCodec::Pcm => "pcm_s16le",
+        VideoAudioCodec::None => "none",
     };
 
-    // For single-clip fast native export, apply trim, speed, color grading, flip, blur, scale & text directly in FFmpeg
     let clip = &clips[0];
+    let fx = &clip.fx;
     let mut args: Vec<String> = vec!["-y".into()];
-
-    if settings.hardware_decode && cfg!(target_os = "macos") {
+    if settings.hardware_encode && cfg!(target_os = "macos") {
         args.extend(["-hwaccel".into(), "videotoolbox".into()]);
     }
-
     args.extend([
         "-ss".into(),
         format!("{:.3}", clip.trim_start_sec),
@@ -323,65 +1034,112 @@ pub fn export_timeline(
         clip.path.to_string_lossy().to_string(),
     ]);
 
-    // Build video filter chain
-    let mut vf_parts: Vec<String> = Vec::new();
+    let mut vf: Vec<String> = Vec::new();
     if (clip.speed - 1.0).abs() > 0.01 {
-        vf_parts.push(format!("setpts=PTS/{:.4}", clip.speed));
+        vf.push(format!("setpts=PTS/{:.4}", clip.speed));
     }
-    if clip.brightness.abs() > 0.01
-        || (clip.contrast - 1.0).abs() > 0.01
-        || (clip.saturation - 1.0).abs() > 0.01
-    {
-        vf_parts.push(format!(
+
+    let b = (fx.brightness - 100.0) / 100.0;
+    let c = fx.contrast / 100.0;
+    let s = fx.saturation / 100.0;
+    if b.abs() > 0.01 || (c - 1.0).abs() > 0.01 || (s - 1.0).abs() > 0.01 {
+        vf.push(format!(
             "eq=brightness={:.3}:contrast={:.3}:saturation={:.3}",
-            clip.brightness, clip.contrast, clip.saturation
+            b, c, s
         ));
     }
-    if clip.hue_deg.abs() > 0.5 {
-        vf_parts.push(format!("hue=h={:.1}", clip.hue_deg));
+    if fx.hue_deg.abs() > 0.5 {
+        vf.push(format!("hue=h={:.1}", fx.hue_deg));
     }
-    if clip.grayscale {
-        vf_parts.push("hue=s=0".into());
+    match fx.look {
+        VideoLook::Grayscale | VideoLook::NightVision => vf.push("hue=s=0".into()),
+        VideoLook::Sepia | VideoLook::Vintage => {
+            vf.push("colorchannelmixer=.393:.769:.189:0:.349:.686:.168:0:.272:.534:.131".into())
+        }
+        VideoLook::Invert => vf.push("negate".into()),
+        VideoLook::None | VideoLook::CrossProcess | VideoLook::Cyanotype => {}
     }
-    if clip.sepia {
-        vf_parts.push("colorchannelmixer=.393:.769:.189:0:.349:.686:.168:0:.272:.534:.131".into());
+    let blur_total = fx.blur_px + fx.s_rack_defocus * 0.1 + fx.s_z_blur * 0.08 + fx.s_edge_blur * 0.08;
+    if blur_total > 0.1 {
+        vf.push(format!("boxblur={:.1}:1", blur_total.min(25.0)));
     }
-    if clip.invert {
-        vf_parts.push("negate".into());
+    if fx.sharpen > 1.0 || fx.s_beauty > 1.0 {
+        let amt = (fx.sharpen / 50.0) - (fx.s_beauty / 120.0);
+        vf.push(format!("unsharp=5:5:{:.2}:5:5:0.0", amt));
     }
-    if clip.blur > 0.1 {
-        vf_parts.push(format!("boxblur={:.1}:1", clip.blur));
+    if fx.flip_h {
+        vf.push("hflip".into());
     }
-    if clip.mirror_h {
-        vf_parts.push("hflip".into());
+    if fx.flip_v {
+        vf.push("vflip".into());
     }
-    if clip.mirror_v {
-        vf_parts.push("vflip".into());
+    if fx.vignette > 0.02 || fx.bcc_vignette > 1.0 {
+        vf.push("vignette".into());
+    }
+    if fx.film_grain > 0.02 || fx.bcc_film_grain > 1.0 || fx.s_film_damage > 1.0 {
+        let strength = (fx.film_grain * 25.0 + fx.bcc_film_grain * 0.25 + fx.s_film_damage * 0.25).min(45.0);
+        vf.push(format!("noise=alls={:.0}:allf=t+u", strength));
+    }
+    if fx.s_glow > 1.0 || fx.s_halation > 1.0 {
+        let g_boost = (fx.s_glow + fx.s_halation) * 0.002;
+        vf.push(format!("eq=brightness={:.3}:contrast={:.3}", g_boost.min(0.25), 1.0 + g_boost));
     }
     if let Some(h) = settings.resolution.height() {
-        vf_parts.push(format!("scale=-2:{}", h));
+        vf.push(format!("scale=-2:{}", h));
     }
-    if !clip.overlay_text.trim().is_empty() {
-        let escaped = clip
-            .overlay_text
-            .replace('\\', "\\\\")
-            .replace(':', "\\:")
-            .replace('\'', "\\'");
-        vf_parts.push(format!(
-            "drawtext=text='{}':fontcolor=white:fontsize=36:x=(w-text_w)/2:y=h-th-40:box=1:boxcolor=black@0.5:boxborderw=8",
-            escaped
-        ));
-    }
-
-    if !vf_parts.is_empty() {
-        args.extend(["-vf".into(), vf_parts.join(",")]);
+    if let Some(ar) = project.aspect.ratio() {
+        match project.framing {
+            FramingMode::FillCrop => {
+                vf.push(format!("crop=ih*{:.4}:ih", ar));
+            }
+            FramingMode::FitLetterbox => {
+                vf.push(format!(
+                    "pad=max(iw\\,ih*{:.4}):max(ih\\,iw/{:.4}):(ow-iw)/2:(oh-ih)/2:black",
+                    ar, ar
+                ));
+            }
+        }
     }
 
+    for tx in texts {
+        if !tx.text.trim().is_empty() {
+            let escaped = tx
+                .text
+                .replace('\\', "\\\\")
+                .replace(':', "\\:")
+                .replace('\'', "\\'");
+            let hex_col = format!("#{:02x}{:02x}{:02x}", tx.color[0], tx.color[1], tx.color[2]);
+            let end_clause = if tx.end_sec > 0.0 {
+                format!(":enable='between(t,{:.2},{:.2})'", tx.start_sec, tx.end_sec)
+            } else {
+                format!(":enable='gte(t,{:.2})'", tx.start_sec)
+            };
+            vf.push(format!(
+                "drawtext=text='{}':fontcolor={}:fontsize=h*{:.3}:x=w*{:.3}-text_w/2:y=h*{:.3}-text_h/2:box=1:boxcolor=black@0.45:boxborderw=6{}",
+                escaped,
+                hex_col,
+                tx.size_pct / 100.0,
+                tx.x_pct / 100.0,
+                tx.y_pct / 100.0,
+                end_clause
+            ));
+        }
+    }
+
+    if !vf.is_empty() {
+        args.extend(["-vf".into(), vf.join(",")]);
+    }
+
+    let br_kbps = if settings.auto_bitrate {
+        12_000
+    } else {
+        settings.video_bitrate_mbps * 1000
+    };
     args.extend([
         "-c:v".into(),
         vcodec.into(),
         "-b:v".into(),
-        format!("{}k", settings.video_bitrate_kbps),
+        format!("{}k", br_kbps),
         "-r".into(),
         settings.fps.to_string(),
     ]);
@@ -398,48 +1156,41 @@ pub fn export_timeline(
             acodec.into(),
             "-b:a".into(),
             format!("{}k", settings.audio_bitrate_kbps),
-            "-ar".into(),
-            settings.sample_rate.to_string(),
         ]);
     }
 
     args.push(output_path.to_string_lossy().to_string());
 
-    let output = Command::new("ffmpeg")
+    let out = Command::new("ffmpeg")
         .args(&args)
         .output()
-        .map_err(|e| format!("Failed to run ffmpeg (install via `brew install ffmpeg`): {}", e))?;
+        .map_err(|e| format!("Failed to invoke ffmpeg (`brew install ffmpeg`): {}", e))?;
 
-    if !output.status.success() {
-        let err = String::from_utf8_lossy(&output.stderr);
-        return Err(format!("FFmpeg failed: {}", err));
+    if !out.status.success() {
+        return Err(format!(
+            "FFmpeg export error: {}",
+            String::from_utf8_lossy(&out.stderr)
+        ));
     }
 
     Ok(format!(
-        "Exported {} ({}) → {}",
+        "Exported {} ({} @ {} fps) → {}",
         settings.container.ext().to_uppercase(),
         vcodec,
+        settings.fps,
         output_path.display()
     ))
 }
 
-pub fn export_audio_file(
-    input_path: &Path,
-    output_path: &Path,
-    params: &AudioDspParams,
-) -> Result<String, String> {
-    // Decode input audio (any format supported by FFmpeg) into a temporary 32-bit float WAV
-    let mut temp_in = std::env::temp_dir();
-    temp_in.push("grain_rust_dsp_in.wav");
-
+pub fn decode_audio_stereo(input_path: &Path) -> Result<(Vec<f32>, Vec<f32>, u32), String> {
+    let temp_wav = std::env::temp_dir().join("grain_audio_decode.wav");
     let dec = Command::new("ffmpeg")
         .args(["-y", "-i"])
         .arg(input_path)
-        .args(["-c:a", "pcm_f32le", "-ar", "48000", "-ac", "2"])
-        .arg(&temp_in)
+        .args(["-c:a", "pcm_f32le", "-ac", "2"])
+        .arg(&temp_wav)
         .output()
-        .map_err(|e| format!("Failed to invoke ffmpeg for audio decode: {}", e))?;
-
+        .map_err(|e| format!("Failed to run ffmpeg: {}", e))?;
     if !dec.status.success() {
         return Err(format!(
             "Audio decode failed: {}",
@@ -448,56 +1199,83 @@ pub fn export_audio_file(
     }
 
     let mut reader =
-        hound::WavReader::open(&temp_in).map_err(|e| format!("WAV read error: {}", e))?;
+        hound::WavReader::open(&temp_wav).map_err(|e| format!("WAV read error: {}", e))?;
     let spec = reader.spec();
-    let interleaved: Vec<f32> = reader
-        .samples::<f32>()
-        .filter_map(Result::ok)
-        .collect();
-
-    let ch_count = spec.channels.max(1) as usize;
-    let frame_count = interleaved.len() / ch_count;
-    let mut channels = vec![Vec::with_capacity(frame_count); ch_count];
-
-    for frame in 0..frame_count {
-        for c in 0..ch_count {
-            channels[c].push(interleaved[frame * ch_count + c]);
-        }
+    let samples: Vec<f32> = reader.samples::<f32>().filter_map(Result::ok).collect();
+    let frames = samples.len() / 2;
+    let mut left = Vec::with_capacity(frames);
+    let mut right = Vec::with_capacity(frames);
+    for i in 0..frames {
+        left.push(samples[i * 2]);
+        right.push(samples[i * 2 + 1]);
     }
+    Ok((left, right, spec.sample_rate))
+}
 
-    let processed_channels: Vec<Vec<f32>> = channels
-        .iter()
-        .map(|ch| process_channel(ch, spec.sample_rate, params))
-        .collect();
+pub fn process_and_export_audio(
+    input_path: &Path,
+    output_path: &Path,
+    st: &AudioLabState,
+) -> Result<String, String> {
+    let (left, right, src_sr) = decode_audio_stereo(input_path)?;
+    let (proc_l, proc_r) = process_stereo(&left, &right, src_sr, st);
 
-    let out_len = processed_channels
-        .iter()
-        .map(|c| c.len())
-        .min()
-        .unwrap_or(0);
-
-    let out_spec = hound::WavSpec {
-        channels: spec.channels,
-        sample_rate: spec.sample_rate,
+    let temp_processed = std::env::temp_dir().join("grain_audio_processed.wav");
+    let spec = hound::WavSpec {
+        channels: 2,
+        sample_rate: src_sr,
         bits_per_sample: 32,
         sample_format: hound::SampleFormat::Float,
     };
-
-    let mut writer = hound::WavWriter::create(output_path, out_spec)
-        .map_err(|e| format!("Failed to create output WAV: {}", e))?;
-
-    for i in 0..out_len {
-        for c in 0..ch_count {
-            writer
-                .write_sample(processed_channels[c][i])
-                .map_err(|e| e.to_string())?;
-        }
+    let mut writer = hound::WavWriter::create(&temp_processed, spec)
+        .map_err(|e| format!("WAV write error: {}", e))?;
+    for i in 0..proc_l.len() {
+        writer.write_sample(proc_l[i]).map_err(|e| e.to_string())?;
+        writer.write_sample(proc_r[i]).map_err(|e| e.to_string())?;
     }
     writer.finalize().map_err(|e| e.to_string())?;
 
+    let target_sr = st.export_sample_rate.to_string();
+    let bitrate = format!("{}k", st.export_bitrate_kbps);
+    let mut args = vec![
+        "-y".to_string(),
+        "-i".to_string(),
+        temp_processed.to_string_lossy().to_string(),
+        "-ar".to_string(),
+        target_sr,
+    ];
+
+    match st.export_format {
+        AudioExportFormat::Wav16 => args.extend(["-c:a".into(), "pcm_s16le".into()]),
+        AudioExportFormat::Wav24 => args.extend(["-c:a".into(), "pcm_s24le".into()]),
+        AudioExportFormat::WavF32 => args.extend(["-c:a".into(), "pcm_f32le".into()]),
+        AudioExportFormat::Flac16 => {
+            args.extend(["-c:a".into(), "flac".into(), "-sample_fmt".into(), "s16".into()])
+        }
+        AudioExportFormat::Flac24 => {
+            args.extend(["-c:a".into(), "flac".into(), "-sample_fmt".into(), "s32".into()])
+        }
+        AudioExportFormat::AacM4a => {
+            args.extend(["-c:a".into(), "aac".into(), "-b:a".into(), bitrate])
+        }
+        AudioExportFormat::OggOpus => {
+            args.extend(["-c:a".into(), "libopus".into(), "-b:a".into(), bitrate])
+        }
+    }
+    args.push(output_path.to_string_lossy().to_string());
+
+    let enc = Command::new("ffmpeg")
+        .args(&args)
+        .output()
+        .map_err(|e| format!("FFmpeg encode error: {}", e))?;
+    if !enc.status.success() {
+        return Err(String::from_utf8_lossy(&enc.stderr).to_string());
+    }
+
     Ok(format!(
-        "Rust DSP ({}) exported → {}",
-        params.effect.label(),
+        "Exported {} ({} Hz) → {}",
+        st.export_format.label(),
+        st.export_sample_rate,
         output_path.display()
     ))
 }

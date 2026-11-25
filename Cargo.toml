@@ -1,8 +1,8 @@
 [package]
 name = "grain-video-editor"
-version = "0.3.0"
+version = "0.5.0"
 edition = "2021"
-description = "Grain Video & Audio Editor — 100% Pure Rust native macOS M3 Apple Silicon application"
+description = "Grain Video & Audio Editor — Complete 100% Pure Rust Port + OpenFX (.ofx.bundle) Host + Full BorisFX Sapphire S_ Suite"
 authors = ["Grain"]
 
 [dependencies]
@@ -11,18 +11,17 @@ egui = "0.29"
 rfd = "0.15"
 hound = "3.5"
 rustfft = "6.2"
-serde = { version = "1.0", features = ["derive"] }
-serde_json = "1.0"
+libloading = "0.8"
 
 [package.metadata.bundle]
 name = "Grain Video Editor"
 identifier = "com.grain.videoeditor"
 icon = ["assets/icons/icon.icns", "assets/icons/128x128@2x.png"]
-version = "0.3.0"
+version = "0.5.0"
 copyright = "Copyright (c) Grain"
 category = "public.app-category.video"
-short_description = "Native Rust Video & Audio Editor for Apple Silicon"
-long_description = "100% Pure Rust desktop video and audio editor with native macOS VideoToolbox hardware acceleration and Rust audio DSP."
+short_description = "Native Rust Video & Audio Studio + OpenFX Host for Apple Silicon"
+long_description = "100% Pure Rust desktop video and audio editor with native OpenFX (.ofx.bundle) plugin host, full BorisFX Sapphire S_ suite, and macOS VideoToolbox."
 
 [profile.release]
 opt-level = 3
