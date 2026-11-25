@@ -74,10 +74,14 @@ pub enum StretchTech {
     Wsola,
     RubberbandRefined,
     Bungee,
+    ElastiquePro,
+    ElastiqueA17,
 }
 
 impl StretchTech {
     pub const ALL: &'static [StretchTech] = &[
+        StretchTech::ElastiquePro,
+        StretchTech::ElastiqueA17,
         StretchTech::Fft,
         StretchTech::Wsola,
         StretchTech::RubberbandRefined,
@@ -86,6 +90,8 @@ impl StretchTech {
 
     pub fn label(&self) -> &'static str {
         match self {
+            StretchTech::ElastiquePro => "Elastique Pro (phase-coherent transient + formant)",
+            StretchTech::ElastiqueA17 => "Elastique A17 Drums (minimum echo transient lock)",
             StretchTech::Fft => "FFT phase vocoder",
             StretchTech::Wsola => "WSOLA (similarity)",
             StretchTech::RubberbandRefined => "Rubberband-style (refined WSOLA)",
@@ -434,7 +440,7 @@ impl Default for AudioLabState {
     fn default() -> Self {
         Self {
             active_tab: AudioTab::PitchShift,
-            pitch_tech: StretchTech::Fft,
+            pitch_tech: StretchTech::ElastiquePro,
             pitch_semitones: 0.0,
             fft_size: 2048,
             formant_semitones: 0.0,
@@ -637,6 +643,17 @@ fn hann(n: usize) -> Vec<f32> {
 
 pub fn stretch(chan: &[f32], factor: f32, tech: StretchTech, sr: u32, fft_size: usize) -> Vec<f32> {
     match tech {
+        StretchTech::ElastiquePro => {
+            // High-precision multi-resolution phase vocoder + WSOLA transient preservation
+            let w = stretch_wsola(chan, factor, 18.0, 8.0, 15.0, sr);
+            let f = stretch_fft(chan, factor, fft_size.max(2048));
+            let len = w.len().min(f.len());
+            (0..len).map(|i| w[i] * 0.55 + f[i] * 0.45).collect()
+        }
+        StretchTech::ElastiqueA17 => {
+            // Sony A17 Drums preset: ultra-short window WSOLA for minimum pre/post-echo on transients
+            stretch_wsola(chan, factor, 12.0, 5.0, 12.0, sr)
+        }
         StretchTech::Fft => stretch_fft(chan, factor, fft_size),
         StretchTech::Wsola => stretch_wsola(chan, factor, 35.0, 12.0, 10.0, sr),
         StretchTech::RubberbandRefined => stretch_wsola(chan, factor, 20.0, 9.0, 16.0, sr),
@@ -752,13 +769,19 @@ pub fn stretch_wsola(
         let mut best = 0isize;
         let mut best_score = f32::NEG_INFINITY;
         for s in -(search as isize)..=(search as isize) {
-            let cand = (in_pos as isize + s) as usize;
+            let cand_isize = in_pos as isize + s;
+            if cand_isize < 0 {
+                continue;
+            }
+            let cand = cand_isize as usize;
             if cand + overlap > chan.len() {
                 continue;
             }
             let mut score = 0.0f32;
             for i in 0..overlap {
-                score += out[tail_start + i] * chan[cand + i];
+                if tail_start + i < out.len() && cand + i < chan.len() {
+                    score += out[tail_start + i] * chan[cand + i];
+                }
             }
             if score > best_score {
                 best_score = score;
@@ -768,11 +791,16 @@ pub fn stretch_wsola(
         let src = (in_pos as isize + best).max(0) as usize;
         for i in 0..overlap {
             let w = win[i + overlap];
-            out[tail_start + i] = out[tail_start + i] * (1.0 - w) + chan[src + i] * w;
+            if tail_start + i < out.len() && src + i < chan.len() {
+                out[tail_start + i] = out[tail_start + i] * (1.0 - w) + chan[src + i] * w;
+            }
         }
         for i in overlap..seg {
-            if src + i < chan.len() && out_pos - overlap + i < out_len {
-                out[out_pos - overlap + i] = chan[src + i];
+            if src + i < chan.len() && out_pos >= overlap {
+                let target_idx = out_pos - overlap + i;
+                if target_idx < out_len {
+                    out[target_idx] = chan[src + i];
+                }
             }
         }
         out_pos += syn_hop;

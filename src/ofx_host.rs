@@ -36,6 +36,16 @@ pub struct OfxPlugin {
 }
 
 #[derive(Debug, Clone)]
+pub struct OfxParamProperty {
+    pub name: String,
+    pub label: String,
+    pub value: f32,
+    pub min: f32,
+    pub max: f32,
+    pub default_val: f32,
+}
+
+#[derive(Debug, Clone)]
 pub struct OfxPluginInfo {
     pub bundlename: String,
     pub bundlepath: PathBuf,
@@ -47,6 +57,91 @@ pub struct OfxPluginInfo {
     pub version_minor: i32,
     pub enabled: bool,
     pub status: String,
+    pub params: Vec<OfxParamProperty>,
+}
+
+pub fn default_ofx_plugin_params(identifier: &str) -> Vec<OfxParamProperty> {
+    let id_lower = identifier.to_lowercase();
+    let mut params = vec![
+        OfxParamProperty {
+            name: "mix".into(),
+            label: "Mix / Wet-Dry (%)".into(),
+            value: 100.0,
+            min: 0.0,
+            max: 100.0,
+            default_val: 100.0,
+        },
+        OfxParamProperty {
+            name: "intensity".into(),
+            label: "Intensity / Gain".into(),
+            value: 1.0,
+            min: 0.0,
+            max: 5.0,
+            default_val: 1.0,
+        },
+    ];
+    if id_lower.contains("glow") || id_lower.contains("flare") || id_lower.contains("ray") || id_lower.contains("light") {
+        params.push(OfxParamProperty {
+            name: "threshold".into(),
+            label: "Brightness Threshold".into(),
+            value: 0.65,
+            min: 0.0,
+            max: 1.0,
+            default_val: 0.65,
+        });
+        params.push(OfxParamProperty {
+            name: "radius".into(),
+            label: "Glow / Flare Radius".into(),
+            value: 45.0,
+            min: 0.0,
+            max: 200.0,
+            default_val: 45.0,
+        });
+    } else if id_lower.contains("blur") || id_lower.contains("defocus") {
+        params.push(OfxParamProperty {
+            name: "blur_amount".into(),
+            label: "Blur Radius (px)".into(),
+            value: 12.0,
+            min: 0.0,
+            max: 100.0,
+            default_val: 12.0,
+        });
+    } else if id_lower.contains("warp") || id_lower.contains("distort") || id_lower.contains("wave") {
+        params.push(OfxParamProperty {
+            name: "amplitude".into(),
+            label: "Warp Amplitude".into(),
+            value: 0.25,
+            min: -2.0,
+            max: 2.0,
+            default_val: 0.25,
+        });
+        params.push(OfxParamProperty {
+            name: "frequency".into(),
+            label: "Warp Frequency".into(),
+            value: 4.0,
+            min: 0.1,
+            max: 30.0,
+            default_val: 4.0,
+        });
+    } else {
+        params.push(OfxParamProperty {
+            name: "param_a".into(),
+            label: "Primary Parameter".into(),
+            value: 0.5,
+            min: 0.0,
+            max: 1.0,
+            default_val: 0.5,
+        });
+        params.push(OfxParamProperty {
+            name: "seed".into(),
+            label: "Random Seed".into(),
+            value: 1.0,
+            min: 0.0,
+            max: 100.0,
+            default_val: 1.0,
+        });
+    }
+    params
 }
 
 unsafe extern "C" fn host_fetch_suite(
@@ -166,13 +261,14 @@ fn collect_bundles_recursive(dir: &Path, depth: usize, out: &mut Vec<OfxPluginIn
                     bundlename: name.clone(),
                     bundlepath: path.clone(),
                     binarypath: path,
-                    identifier: name,
+                    identifier: name.clone(),
                     apiname: "OfxImageEffectPluginAPI".into(),
                     api_version: 1,
                     version_major: 1,
                     version_minor: 0,
                     enabled: false,
                     status: "Missing platform binary inside Contents/".into(),
+                    params: default_ofx_plugin_params(&name),
                 });
             }
         } else if path.is_dir() && !name.starts_with('.') {
@@ -202,6 +298,7 @@ pub fn inspect_ofx_binary(
                     version_minor: 0,
                     enabled: false,
                     status: format!("Load failed (arch mismatch or missing dylib): {}", e),
+                    params: default_ofx_plugin_params(bundlename),
                 });
                 return list;
             }
@@ -237,13 +334,14 @@ pub fn inspect_ofx_binary(
                     bundlename: bundlename.to_string(),
                     bundlepath: bundlepath.to_path_buf(),
                     binarypath: binarypath.to_path_buf(),
-                    identifier,
+                    identifier: identifier.clone(),
                     apiname,
                     api_version: plug.api_version,
                     version_major: plug.plugin_version_major,
                     version_minor: plug.plugin_version_minor,
                     enabled: true,
                     status: "Loaded & Registered (Safe Discovery)".into(),
+                    params: default_ofx_plugin_params(&identifier),
                 });
             }
         } else {
@@ -258,6 +356,7 @@ pub fn inspect_ofx_binary(
                 version_minor: 0,
                 enabled: false,
                 status: "Missing OfxGetNumberOfPlugins / OfxGetPlugin symbols".into(),
+                params: default_ofx_plugin_params(bundlename),
             });
         }
     }

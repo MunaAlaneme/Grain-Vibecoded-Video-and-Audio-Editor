@@ -2,6 +2,7 @@
 
 mod audio_dsp;
 mod media_engine;
+mod elastique_cli;
 mod ofx_host;
 
 use audio_dsp::{
@@ -14,7 +15,7 @@ use media_engine::{
     process_and_export_audio, validate_video_export, AspectRatioPreset, ContainerFormat,
     EasingCurve, FramingMode, MaskType, MusicTrackItem, OverlayTrackItem, ProjectSettings,
     ResolutionPreset, TextOverlayItem, TimelineClip, TransitionType, VideoAudioCodec, VideoCodec,
-    build_dynamic_ffmpeg_filter, evaluate_keyframed_params, EffectKeyframe, VideoExportSettings, VideoFxParams, VideoKeyframe, VideoLook,
+    build_dynamic_ffmpeg_filter, evaluate_keyframed_params, extract_video_frame_rgba, EffectKeyframe, VideoExportSettings, VideoFxParams, VideoKeyframe, VideoLook,
 };
 use ofx_host::{default_ofx_searchpaths, inspect_ofx_binary, scan_ofx_directories, OfxPluginInfo};
 use std::path::PathBuf;
@@ -104,11 +105,18 @@ struct GrainStudioApp {
     effect_keyframes: Vec<EffectKeyframe>,
     selectedeasing: EasingCurve,
 
-    // Vegas Pro 15 Timeline Controls
+    // Vegas Pro 15 Timeline Controls & Real-Time Preview State
     tl_zoom: f32,
     snapenabled: bool,
     playhead_sec: f64,
     is_playing: bool,
+    audio_is_playing: bool,
+    ffplay_child: Option<std::process::Child>,
+    preview_texture: Option<egui::TextureHandle>,
+    last_preview_sec: f64,
+    last_preview_clip_idx: Option<usize>,
+    last_preview_fx_sig: String,
+    selected_ofx_plugin_idx: usize,
     source_res: (u32, u32),
     undo_stack: Vec<TimelineSnapshot>,
     redo_stack: Vec<TimelineSnapshot>,
@@ -176,6 +184,13 @@ impl Default for GrainStudioApp {
             snapenabled: true,
             playhead_sec: 0.0,
             is_playing: false,
+            audio_is_playing: false,
+            ffplay_child: None,
+            preview_texture: None,
+            last_preview_sec: -1.0,
+            last_preview_clip_idx: None,
+            last_preview_fx_sig: String::new(),
+            selected_ofx_plugin_idx: 0,
             source_res: (1920, 1080),
             undo_stack: Vec::new(),
             redo_stack: Vec::new(),
@@ -188,6 +203,114 @@ impl Default for GrainStudioApp {
 }
 
 impl GrainStudioApp {
+
+    fn stop_playback_process(&mut self) {
+        if let Some(mut child) = self.ffplay_child.take() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+        self.is_playing = false;
+        self.audio_is_playing = false;
+    }
+
+    fn start_ffplay_audio(&mut self, path: &std::path::Path, start_sec: f64) {
+        self.stop_playback_process();
+        if let Ok(child) = std::process::Command::new("ffplay")
+            .args(["-nodisp", "-autoexit", "-loglevel", "quiet", "-ss"])
+            .arg(format!("{:.3}", start_sec.max(0.0)))
+            .arg(path)
+            .spawn()
+        {
+            self.ffplay_child = Some(child);
+            self.audio_is_playing = true;
+        } else {
+            self.set_status("Could not spawn ffplay for audio playback (`brew install ffmpeg`).", true);
+        }
+    }
+
+    fn start_ffplay_video_audio(&mut self, path: &std::path::Path, start_sec: f64) {
+        if let Some(mut child) = self.ffplay_child.take() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+        if let Ok(child) = std::process::Command::new("ffplay")
+            .args(["-nodisp", "-autoexit", "-loglevel", "quiet", "-ss"])
+            .arg(format!("{:.3}", start_sec.max(0.0)))
+            .arg(path)
+            .spawn()
+        {
+            self.ffplay_child = Some(child);
+        }
+    }
+
+    fn compute_effective_preview_fx(&self, clip: &TimelineClip) -> VideoFxParams {
+        let mut fx = if !self.effect_keyframes.is_empty() {
+            evaluate_keyframed_params(&self.effect_keyframes, self.playhead_sec)
+        } else {
+            clip.fx.clone()
+        };
+        // Apply active OpenFX plugin properties into the live preview chain
+        for plug in &self.ofx_plugins {
+            if self.active_ofx_identifiers.contains(&plug.identifier) {
+                let mix = plug
+                    .params
+                    .iter()
+                    .find(|p| p.name == "mix")
+                    .map(|p| p.value / 100.0)
+                    .unwrap_or(1.0);
+                let intensity = plug
+                    .params
+                    .iter()
+                    .find(|p| p.name == "intensity")
+                    .map(|p| p.value)
+                    .unwrap_or(1.0);
+                let id_l = plug.identifier.to_lowercase();
+                if id_l.contains("glow") || id_l.contains("flare") || id_l.contains("light") {
+                    fx.s_glow = (fx.s_glow + 45.0 * mix * intensity).min(100.0);
+                } else if id_l.contains("blur") || id_l.contains("defocus") {
+                    let r = plug.params.iter().find(|p| p.name == "blur_amount").map(|p| p.value).unwrap_or(8.0);
+                    fx.blur_px = (fx.blur_px + r * mix * 0.4).min(20.0);
+                } else {
+                    fx.contrast = (fx.contrast + 12.0 * mix * intensity).min(200.0);
+                }
+            }
+        }
+        fx
+    }
+
+    fn update_video_preview_texture(&mut self, ctx: &egui::Context) {
+        let Some(idx) = self.selected_clip_idx else {
+            return;
+        };
+        let Some(clip) = self.clips.get(idx).cloned() else {
+            return;
+        };
+        let target_time = (clip.trim_start_sec + self.playhead_sec * clip.speed as f64)
+            .clamp(clip.trim_start_sec, clip.trim_end_sec);
+
+        let eff_fx = self.compute_effective_preview_fx(&clip);
+        let pw = 480u32;
+        let ph = 270u32;
+        let fx_sig = media_engine::build_preview_vf_chain(&eff_fx, pw, ph);
+
+        if self.last_preview_clip_idx == Some(idx)
+            && (self.last_preview_sec - target_time).abs() < 0.04
+            && self.last_preview_fx_sig == fx_sig
+            && self.preview_texture.is_some()
+        {
+            return;
+        }
+
+        if let Ok(rgba) = extract_video_frame_rgba(&clip.path, target_time, pw, ph, &eff_fx) {
+            let img = egui::ColorImage::from_rgba_unmultiplied([pw as usize, ph as usize], &rgba);
+            let tex = ctx.load_texture("video_preview_frame", img, egui::TextureOptions::LINEAR);
+            self.preview_texture = Some(tex);
+            self.last_preview_sec = target_time;
+            self.last_preview_clip_idx = Some(idx);
+            self.last_preview_fx_sig = fx_sig;
+        }
+    }
+
     fn set_status(&mut self, msg: impl Into<String>, err: bool) {
         self.status_text = msg.into();
         self.status_error = err;
@@ -567,6 +690,26 @@ impl eframe::App for GrainStudioApp {
             self.render_project_modal(ctx);
         }
 
+        if self.is_playing {
+            let dt = ctx.input(|i| i.stable_dt as f64).min(0.1);
+            self.playhead_sec += dt;
+            let total = self.total_timeline_duration();
+            if self.playhead_sec >= total {
+                self.playhead_sec = 0.0;
+                self.stop_playback_process();
+            }
+            ctx.request_repaint();
+        }
+        if self.audio_is_playing && self.audio_duration_sec > 0.0 {
+            let dt = ctx.input(|i| i.stable_dt as f64).min(0.1);
+            self.audio_playhead_frac += (dt / self.audio_duration_sec) as f32;
+            if self.audio_playhead_frac >= 1.0 {
+                self.audio_playhead_frac = 0.0;
+                self.stop_playback_process();
+            }
+            ctx.request_repaint();
+        }
+
         match self.mode {
             AppMode::Audio => self.render_audio_mode(ctx),
             AppMode::Video => self.render_video_mode(ctx),
@@ -657,6 +800,21 @@ impl GrainStudioApp {
                             if ui.button("📂 Choose Audio / Video File...").clicked() {
                                 self.import_audio_file();
                             }
+                            let a_play_lbl = if self.audio_is_playing { "❚❚ Pause" } else { "▶ Play" };
+                            if ui.button(a_play_lbl).clicked() {
+                                if self.audio_is_playing {
+                                    self.stop_playback_process();
+                                } else if let Some(p) = self.audiopath.clone() {
+                                    let start_t = self.audio_playhead_frac as f64 * self.audio_duration_sec;
+                                    self.start_ffplay_audio(&p, start_t);
+                                } else {
+                                    self.set_status("Load an audio file first to play.", true);
+                                }
+                            }
+                            if ui.button("⏹ Stop").clicked() {
+                                self.stop_playback_process();
+                                self.audio_playhead_frac = 0.0;
+                            }
                             ui.label(egui::RichText::new(&self.audio_filename).strong());
                             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                                 ui.add(
@@ -744,6 +902,14 @@ impl GrainStudioApp {
 
                         match self.audio_state.active_tab {
                             AudioTab::PitchShift => {
+                                ui.horizontal(|ui| {
+                                    if ui.button("🎛 Elastique Pro").clicked() {
+                                        self.audio_state.pitch_tech = StretchTech::ElastiquePro;
+                                    }
+                                    if ui.button("🥁 Elastique A17 Drums").clicked() {
+                                        self.audio_state.pitch_tech = StretchTech::ElastiqueA17;
+                                    }
+                                });
                                 egui::ComboBox::from_label("Technique")
                                     .selected_text(self.audio_state.pitch_tech.label())
                                     .show_ui(ui, |ui| {
@@ -1526,8 +1692,17 @@ impl GrainStudioApp {
                 let mon_h = (avail.y - 68.0).clamp(180.0, 440.0);
                 let (mon_rect, _) =
                     ui.allocate_exact_size(egui::vec2(mon_w, mon_h), egui::Sense::hover());
+                self.update_video_preview_texture(ctx);
                 let p = ui.painter();
                 p.rect_filled(mon_rect, 3.0, egui::Color32::BLACK);
+                if let Some(tex) = &self.preview_texture {
+                    p.image(
+                        tex.id(),
+                        mon_rect,
+                        egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+                        egui::Color32::WHITE,
+                    );
+                }
                 p.rect_stroke(
                     mon_rect,
                     3.0,
@@ -1612,7 +1787,20 @@ impl GrainStudioApp {
                     )
                     .fill(egui::Color32::from_rgb(45, 212, 191));
                     if ui.add(play_btn).clicked() {
-                        self.is_playing = !self.is_playing;
+                        if self.is_playing {
+                            self.stop_playback_process();
+                        } else {
+                            self.is_playing = true;
+                            if let Some(idx) = self.selected_clip_idx {
+                                if let Some(c) = self.clips.get(idx).cloned() {
+                                    self.start_ffplay_video_audio(&c.path, c.trim_start_sec + self.playhead_sec);
+                                }
+                            }
+                        }
+                    }
+                    if ui.button("⏹ Stop").clicked() {
+                        self.stop_playback_process();
+                        self.playhead_sec = 0.0;
                     }
                     if ui.button(">").clicked() {
                         self.playhead_sec = (self.playhead_sec + 1.0 / 30.0).min(total);
@@ -2055,7 +2243,7 @@ impl GrainStudioApp {
             ui.label("No third-party .ofx.bundle plugins installed in /Library/OFX/Plugins yet.");
             ui.label("Install any macOS arm64 OFX bundle into /Library/OFX/Plugins or click 'Load .ofx.bundle...' above.");
         } else {
-            for plug in &mut self.ofx_plugins {
+            for (p_idx, plug) in self.ofx_plugins.iter_mut().enumerate() {
                 egui::Frame::group(ui.style()).show(ui, |ui| {
                     ui.horizontal(|ui| {
                         let mut active = self.active_ofx_identifiers.contains(&plug.identifier);
@@ -2065,6 +2253,9 @@ impl GrainStudioApp {
                             } else {
                                 self.active_ofx_identifiers.retain(|id| id != &plug.identifier);
                             }
+                        }
+                        if ui.selectable_label(self.selected_ofx_plugin_idx == p_idx, "⚙ Properties").clicked() {
+                            self.selected_ofx_plugin_idx = p_idx;
                         }
                     });
                     ui.small(format!(
@@ -2076,6 +2267,21 @@ impl GrainStudioApp {
                         plug.version_minor
                     ));
                     ui.small(format!("Status: {}", plug.status));
+
+                    // Interactive OpenFX Plugin Properties Inspector
+                    ui.collapsing(format!("Plugin Properties ({})", plug.params.len()), |ui| {
+                        for param in &mut plug.params {
+                            ui.add(
+                                egui::Slider::new(&mut param.value, param.min..=param.max)
+                                    .text(&param.label),
+                            );
+                        }
+                        if ui.button("↺ Reset Plugin Properties").clicked() {
+                            for param in &mut plug.params {
+                                param.value = param.default_val;
+                            }
+                        }
+                    });
                 });
             }
         }
@@ -2174,6 +2380,17 @@ impl GrainStudioApp {
 }
 
 fn main() -> eframe::Result<()> {
+    let args: Vec<String> = std::env::args().collect();
+    if args.len() > 1 && (args[1] == "--elastique" || args[1] == "elastique" || args[1] == "-h" || args[1] == "--help") {
+        let cli_args: Vec<String> = if args[1] == "--elastique" || args[1] == "elastique" {
+            std::iter::once(args[0].clone()).chain(args[2..].iter().cloned()).collect()
+        } else {
+            args
+        };
+        let code = elastique_cli::run_elastique_cli(&cli_args);
+        std::process::exit(code);
+    }
+
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title("Grain — Pure Rust Video & Audio Studio + OpenFX")

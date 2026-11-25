@@ -1375,3 +1375,148 @@ pub fn build_dynamic_ffmpeg_filter(keyframes: &[EffectKeyframe], base_fx: &Video
 
     filters.join(",")
 }
+
+pub fn play_media_preview(path: &Path) -> Result<(), String> {
+    let status = Command::new("ffplay")
+        .arg("-autoexit")
+        .arg("-window_title")
+        .arg("Grain Preview - ffplay")
+        .arg(path)
+        .status()
+        .map_err(|e| format!("Failed to spawn ffplay (`brew install ffmpeg`): {}", e))?;
+    if !status.success() {
+        return Err("ffplay exited with non-zero status".into());
+    }
+    Ok(())
+}
+
+
+pub fn build_preview_vf_chain(fx: &VideoFxParams, w: u32, h: u32) -> String {
+    let mut vf: Vec<String> = vec![format!("scale={}:{}", w, h)];
+
+    let b = (fx.brightness - 100.0) / 100.0;
+    let c = fx.contrast / 100.0;
+    let s = fx.saturation / 100.0;
+    if b.abs() > 0.01 || (c - 1.0).abs() > 0.01 || (s - 1.0).abs() > 0.01 {
+        vf.push(format!(
+            "eq=brightness={:.3}:contrast={:.3}:saturation={:.3}",
+            b, c, s
+        ));
+    }
+    if fx.hue_deg.abs() > 0.5 || fx.hsl_hue_shift.abs() > 0.5 {
+        vf.push(format!("hue=h={:.1}", fx.hue_deg + fx.hsl_hue_shift));
+    }
+    match fx.look {
+        VideoLook::Grayscale | VideoLook::NightVision => vf.push("hue=s=0".into()),
+        VideoLook::Sepia | VideoLook::Vintage => {
+            vf.push("colorchannelmixer=.393:.769:.189:0:.349:.686:.168:0:.272:.534:.131".into())
+        }
+        VideoLook::Invert => vf.push("negate".into()),
+        VideoLook::CrossProcess => vf.push("curves=r='0/0 0.5/0.65 1/1':b='0/0.1 0.5/0.4 1/0.9'".into()),
+        VideoLook::Cyanotype => vf.push("colorchannelmixer=.2:.4:.4:0:.3:.5:.5:0:.4:.6:.8".into()),
+        VideoLook::None => {}
+    }
+    let blur_total = fx.blur_px
+        + fx.s_rack_defocus * 0.1
+        + fx.s_z_blur * 0.08
+        + fx.s_edge_blur * 0.08
+        + fx.zoom_blur * 0.06;
+    if blur_total > 0.1 {
+        vf.push(format!("boxblur={:.1}:1", blur_total.min(20.0)));
+    }
+    if fx.sharpen > 1.0 || fx.s_beauty > 1.0 {
+        let amt = (fx.sharpen / 50.0) - (fx.s_beauty / 120.0);
+        vf.push(format!("unsharp=5:5:{:.2}:5:5:0.0", amt));
+    }
+    if fx.flip_h {
+        vf.push("hflip".into());
+    }
+    if fx.flip_v {
+        vf.push("vflip".into());
+    }
+    if fx.rotate_deg.abs() > 0.5 {
+        vf.push(format!("rotate={:.4}*PI/180", fx.rotate_deg));
+    }
+    if fx.zoom_pct > 101.0 {
+        let z = (fx.zoom_pct / 100.0).min(2.5);
+        vf.push(format!("crop=iw/{:.3}:ih/{:.3},scale={}:{}", z, z, w, h));
+    }
+    if fx.pixelate > 1.5 || fx.bcc_mosaic > 1.5 {
+        let px = fx.pixelate.max(fx.bcc_mosaic).clamp(2.0, 48.0) as u32;
+        let sw = (w / px).max(8);
+        let sh = (h / px).max(8);
+        vf.push(format!("scale={}:{}:flags=neighbor,scale={}:{}:flags=neighbor", sw, sh, w, h));
+    }
+    if fx.vignette > 0.02 || fx.bcc_vignette > 1.0 || fx.spotlight_dark > 5.0 {
+        vf.push("vignette".into());
+    }
+    if fx.film_grain > 0.02 || fx.bcc_film_grain > 1.0 || fx.s_film_damage > 1.0 {
+        let strength = (fx.film_grain * 25.0 + fx.bcc_film_grain * 0.25 + fx.s_film_damage * 0.25).min(45.0);
+        vf.push(format!("noise=alls={:.0}:allf=t+u", strength));
+    }
+    if fx.s_glow > 1.0 || fx.s_halation > 1.0 || fx.glow > 1.0 || fx.bcc_glow > 1.0 {
+        let g_boost = (fx.s_glow + fx.s_halation + fx.glow + fx.bcc_glow) * 0.0018;
+        vf.push(format!("eq=brightness={:.3}:contrast={:.3}", g_boost.min(0.28), 1.0 + g_boost));
+    }
+    if fx.neon_edges > 2.0 || fx.u_edge_glow > 2.0 {
+        vf.push("edgedetect=low=0.1:high=0.3".into());
+    }
+    if fx.solarize > 2.0 {
+        vf.push("negate".into());
+    }
+    if fx.threshold_bw > 2.0 {
+        vf.push("hue=s=0,eq=contrast=3.0".into());
+    }
+    if fx.crtenabled || fx.scanlines > 0.05 || fx.s_scanlines > 2.0 {
+        vf.push("drawgrid=w=0:h=4:t=1:c=black@0.35".into());
+    }
+    if fx.letterbox > 0.5 {
+        let bar = ((h as f32) * (fx.letterbox / 100.0) * 0.5) as u32;
+        if bar > 0 && bar * 2 < h {
+            vf.push(format!("drawbox=x=0:y=0:w={}:h={}:color=black:t=fill,drawbox=x=0:y={}:w={}:h={}:color=black:t=fill", w, bar, h - bar, w, bar));
+        }
+    }
+
+    vf.join(",")
+}
+
+pub fn extract_video_frame_rgba(
+    path: &Path,
+    time_sec: f64,
+    width: u32,
+    height: u32,
+    fx: &VideoFxParams,
+) -> Result<Vec<u8>, String> {
+    let w = width.max(16) & !1;
+    let h = height.max(16) & !1;
+    let vf_chain = build_preview_vf_chain(fx, w, h);
+    let out = Command::new("ffmpeg")
+        .args([
+            "-ss",
+            &format!("{:.3}", time_sec.max(0.0)),
+            "-i",
+        ])
+        .arg(path)
+        .args([
+            "-vframes",
+            "1",
+            "-vf",
+            &vf_chain,
+            "-f",
+            "rawvideo",
+            "-pix_fmt",
+            "rgba",
+            "pipe:1",
+        ])
+        .output()
+        .map_err(|e| format!("Failed to invoke ffmpeg for frame preview: {}", e))?;
+
+    if !out.status.success() {
+        return Err(String::from_utf8_lossy(&out.stderr).to_string());
+    }
+    let expected = (w * h * 4) as usize;
+    if out.stdout.len() < expected {
+        return Err("Incomplete frame data from ffmpeg".into());
+    }
+    Ok(out.stdout[..expected].to_vec())
+}

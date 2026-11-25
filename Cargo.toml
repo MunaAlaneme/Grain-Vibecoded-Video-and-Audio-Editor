@@ -1,6 +1,6 @@
 [package]
 name = "grain-video-editor"
-version = "0.5.0"
+version = "0.6.3"
 edition = "2021"
 description = "Grain Video & Audio Editor — Complete 100% Pure Rust Port + OpenFX (.ofx.bundle) Host + Full BorisFX Sapphire S_ Suite"
 authors = ["Grain"]
@@ -17,7 +17,7 @@ libloading = "0.8"
 name = "Grain Video Editor"
 identifier = "com.grain.videoeditor"
 icon = ["assets/icons/icon.icns", "assets/icons/128x128@2x.png"]
-version = "0.5.0"
+version = "0.6.3"
 copyright = "Copyright (c) Grain"
 category = "public.app-category.video"
 short_description = "Native Rust Video & Audio Studio + OpenFX Host for Apple Silicon"
