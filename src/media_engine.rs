@@ -385,12 +385,12 @@ pub enum TransitionType {
     Wipe,
     Slide,
     Zoom,
-    S_DissolveGlow,
-    S_DissolveLensFlare,
-    S_DissolveUltraGlow,
-    S_FilmRoll,
-    S_SwishPan,
-    S_HyperPull,
+    SDissolveGlow,
+    SDissolveLensFlare,
+    SDissolveUltraGlow,
+    SFilmRoll,
+    SSwishPan,
+    SHyperPull,
 }
 
 impl TransitionType {
@@ -400,12 +400,12 @@ impl TransitionType {
         TransitionType::Wipe,
         TransitionType::Slide,
         TransitionType::Zoom,
-        TransitionType::S_DissolveGlow,
-        TransitionType::S_DissolveLensFlare,
-        TransitionType::S_DissolveUltraGlow,
-        TransitionType::S_FilmRoll,
-        TransitionType::S_SwishPan,
-        TransitionType::S_HyperPull,
+        TransitionType::SDissolveGlow,
+        TransitionType::SDissolveLensFlare,
+        TransitionType::SDissolveUltraGlow,
+        TransitionType::SFilmRoll,
+        TransitionType::SSwishPan,
+        TransitionType::SHyperPull,
     ];
 
     pub fn label(&self) -> &'static str {
@@ -415,12 +415,12 @@ impl TransitionType {
             TransitionType::Wipe => "Wipe",
             TransitionType::Slide => "Slide",
             TransitionType::Zoom => "Zoom",
-            TransitionType::S_DissolveGlow => "S_DissolveGlow (Sapphire)",
-            TransitionType::S_DissolveLensFlare => "S_DissolveLensFlare (Sapphire)",
-            TransitionType::S_DissolveUltraGlow => "S_DissolveUltraGlow (Sapphire)",
-            TransitionType::S_FilmRoll => "S_FilmRoll (Sapphire)",
-            TransitionType::S_SwishPan => "S_SwishPan (Sapphire)",
-            TransitionType::S_HyperPull => "S_HyperPull (Sapphire)",
+            TransitionType::SDissolveGlow => "SDissolveGlow (Sapphire)",
+            TransitionType::SDissolveLensFlare => "SDissolveLensFlare (Sapphire)",
+            TransitionType::SDissolveUltraGlow => "SDissolveUltraGlow (Sapphire)",
+            TransitionType::SFilmRoll => "SFilmRoll (Sapphire)",
+            TransitionType::SSwishPan => "SSwishPan (Sapphire)",
+            TransitionType::SHyperPull => "SHyperPull (Sapphire)",
         }
     }
 }
@@ -552,12 +552,12 @@ pub struct VideoFxParams {
     pub spotlight_dark: f32,
     pub spotlight_radius: f32,
     // BorisFX Sapphire S_ Suite (40+ effects)
-    pub waves_enabled: bool,
+    pub wavesenabled: bool,
     pub wave_a_amp: f32,
     pub wave_a_freq: f32,
     pub wave_b_amp: f32,
     pub wave_b_freq: f32,
-    pub perspective_enabled: bool,
+    pub perspectiveenabled: bool,
     pub persp_lat: f32,
     pub persp_swing: f32,
     pub persp_roll: f32,
@@ -635,7 +635,7 @@ pub struct VideoFxParams {
     pub bcc_median: u32,
     pub bcc_falsecolor: f32,
     // TV Simulator (CRT)
-    pub crt_enabled: bool,
+    pub crtenabled: bool,
     pub crt_curvature: f32,
     pub crt_scanlines: f32,
     pub crt_phosphor: f32,
@@ -704,12 +704,12 @@ impl Default for VideoFxParams {
             tile_repeat: 1,
             spotlight_dark: 0.0,
             spotlight_radius: 40.0,
-            waves_enabled: false,
+            wavesenabled: false,
             wave_a_amp: 0.0,
             wave_a_freq: 6.0,
             wave_b_amp: 0.0,
             wave_b_freq: 3.0,
-            perspective_enabled: false,
+            perspectiveenabled: false,
             persp_lat: 35.0,
             persp_swing: 0.0,
             persp_roll: 0.0,
@@ -784,7 +784,7 @@ impl Default for VideoFxParams {
             bcc_mosaic: 0.0,
             bcc_median: 0,
             bcc_falsecolor: 0.0,
-            crt_enabled: false,
+            crtenabled: false,
             crt_curvature: 0.5,
             crt_scanlines: 0.5,
             crt_phosphor: 0.35,
@@ -943,7 +943,7 @@ pub fn export_video_sequence(
     texts: &[TextOverlayItem],
     project: &ProjectSettings,
     settings: &VideoExportSettings,
-    output_path: &Path,
+    outputpath: &Path,
 ) -> Result<String, String> {
     if clips.is_empty() {
         return Err("Add at least one clip first.".into());
@@ -975,20 +975,20 @@ pub fn export_video_sequence(
         }
         let zip_res = Command::new("zip")
             .args(["-j", "-q"])
-            .arg(output_path)
+            .arg(outputpath)
             .arg(temp_dir.join("*.jpg"))
             .output();
         if zip_res.is_err() {
             let py = format!(
                 "import zipfile, glob, os; z=zipfile.ZipFile(r'{}','w'); [z.write(f, os.path.basename(f)) for f in sorted(glob.glob(r'{}/*.jpg'))]; z.close()",
-                output_path.display(),
+                outputpath.display(),
                 temp_dir.display()
             );
             let _ = Command::new("python3").args(["-c", &py]).output();
         }
         return Ok(format!(
             "Exported JPEG Frame Sequence ZIP → {}",
-            output_path.display()
+            outputpath.display()
         ));
     }
 
@@ -1159,7 +1159,7 @@ pub fn export_video_sequence(
         ]);
     }
 
-    args.push(output_path.to_string_lossy().to_string());
+    args.push(outputpath.to_string_lossy().to_string());
 
     let out = Command::new("ffmpeg")
         .args(&args)
@@ -1178,15 +1178,15 @@ pub fn export_video_sequence(
         settings.container.ext().to_uppercase(),
         vcodec,
         settings.fps,
-        output_path.display()
+        outputpath.display()
     ))
 }
 
-pub fn decode_audio_stereo(input_path: &Path) -> Result<(Vec<f32>, Vec<f32>, u32), String> {
+pub fn decode_audio_stereo(inputpath: &Path) -> Result<(Vec<f32>, Vec<f32>, u32), String> {
     let temp_wav = std::env::temp_dir().join("grain_audio_decode.wav");
     let dec = Command::new("ffmpeg")
         .args(["-y", "-i"])
-        .arg(input_path)
+        .arg(inputpath)
         .args(["-c:a", "pcm_f32le", "-ac", "2"])
         .arg(&temp_wav)
         .output()
@@ -1213,11 +1213,11 @@ pub fn decode_audio_stereo(input_path: &Path) -> Result<(Vec<f32>, Vec<f32>, u32
 }
 
 pub fn process_and_export_audio(
-    input_path: &Path,
-    output_path: &Path,
+    inputpath: &Path,
+    outputpath: &Path,
     st: &AudioLabState,
 ) -> Result<String, String> {
-    let (left, right, src_sr) = decode_audio_stereo(input_path)?;
+    let (left, right, src_sr) = decode_audio_stereo(inputpath)?;
     let (proc_l, proc_r) = process_stereo(&left, &right, src_sr, st);
 
     let temp_processed = std::env::temp_dir().join("grain_audio_processed.wav");
@@ -1262,7 +1262,7 @@ pub fn process_and_export_audio(
             args.extend(["-c:a".into(), "libopus".into(), "-b:a".into(), bitrate])
         }
     }
-    args.push(output_path.to_string_lossy().to_string());
+    args.push(outputpath.to_string_lossy().to_string());
 
     let enc = Command::new("ffmpeg")
         .args(&args)
@@ -1276,6 +1276,102 @@ pub fn process_and_export_audio(
         "Exported {} ({} Hz) → {}",
         st.export_format.label(),
         st.export_sample_rate,
-        output_path.display()
+        outputpath.display()
     ))
+}
+
+
+#[derive(Debug, Clone)]
+pub struct EffectKeyframe {
+    pub time_sec: f64,
+    pub easing: EasingCurve,
+    pub params: VideoFxParams,
+}
+
+pub fn evaluate_keyframed_params(keyframes: &[EffectKeyframe], current_time: f64) -> VideoFxParams {
+    if keyframes.is_empty() {
+        return VideoFxParams::default();
+    }
+    if current_time <= keyframes[0].time_sec {
+        return keyframes[0].params.clone();
+    }
+    if current_time >= keyframes[keyframes.len() - 1].time_sec {
+        return keyframes[keyframes.len() - 1].params.clone();
+    }
+
+    let mut idx = 0;
+    for i in 0..keyframes.len() - 1 {
+        if current_time >= keyframes[i].time_sec && current_time <= keyframes[i + 1].time_sec {
+            idx = i;
+            break;
+        }
+    }
+
+    let k0 = &keyframes[idx];
+    let k1 = &keyframes[idx + 1];
+
+    let duration = k1.time_sec - k0.time_sec;
+    if duration <= 0.0001 {
+        return k0.params.clone();
+    }
+
+    let raw_t = ((current_time - k0.time_sec) / duration) as f32;
+    let t = k0.easing.eval(raw_t);
+
+    let mut interpolated = k0.params.clone();
+    interpolated.brightness = k0.params.brightness + (k1.params.brightness - k0.params.brightness) * t;
+    interpolated.contrast = k0.params.contrast + (k1.params.contrast - k0.params.contrast) * t;
+    interpolated.saturation = k0.params.saturation + (k1.params.saturation - k0.params.saturation) * t;
+    interpolated.hue_deg = k0.params.hue_deg + (k1.params.hue_deg - k0.params.hue_deg) * t;
+    interpolated.blur_px = k0.params.blur_px + (k1.params.blur_px - k0.params.blur_px) * t;
+    interpolated.vignette = k0.params.vignette + (k1.params.vignette - k0.params.vignette) * t;
+    interpolated.film_grain = k0.params.film_grain + (k1.params.film_grain - k0.params.film_grain) * t;
+    interpolated.glow = k0.params.glow + (k1.params.glow - k0.params.glow) * t;
+    interpolated.glitch = k0.params.glitch + (k1.params.glitch - k0.params.glitch) * t;
+    interpolated.zoom_pct = k0.params.zoom_pct + (k1.params.zoom_pct - k0.params.zoom_pct) * t;
+    interpolated.rotate_deg = k0.params.rotate_deg + (k1.params.rotate_deg - k0.params.rotate_deg) * t;
+    interpolated.s_glow = k0.params.s_glow + (k1.params.s_glow - k0.params.s_glow) * t;
+    interpolated.s_halation = k0.params.s_halation + (k1.params.s_halation - k0.params.s_halation) * t;
+    interpolated.s_rays = k0.params.s_rays + (k1.params.s_rays - k0.params.s_rays) * t;
+    interpolated.s_lens_flare = k0.params.s_lens_flare + (k1.params.s_lens_flare - k0.params.s_lens_flare) * t;
+    interpolated.s_fisheye = k0.params.s_fisheye + (k1.params.s_fisheye - k0.params.s_fisheye) * t;
+    interpolated.s_vortex = k0.params.s_vortex + (k1.params.s_vortex - k0.params.s_vortex) * t;
+
+    interpolated
+}
+
+pub fn build_dynamic_ffmpeg_filter(keyframes: &[EffectKeyframe], base_fx: &VideoFxParams) -> String {
+    let mut filters = Vec::new();
+
+    if keyframes.len() > 1 {
+        let k0 = &keyframes[0];
+        let k1 = &keyframes[1];
+        let dt = (k1.time_sec - k0.time_sec).max(0.001);
+
+        let b0 = (k0.params.brightness - 100.0) / 100.0;
+        let b1 = (k1.params.brightness - 100.0) / 100.0;
+        let c0 = k0.params.contrast / 100.0;
+        let c1 = k1.params.contrast / 100.0;
+        let s0 = k0.params.saturation / 100.0;
+        let s1 = k1.params.saturation / 100.0;
+
+        let b_expr = format!("'{:.3}+({:.3}-({:.3}))*clip((t-{:.3})/{:.3},0,1)'", b0, b1, b0, k0.time_sec, dt);
+        let c_expr = format!("'{:.3}+({:.3}-({:.3}))*clip((t-{:.3})/{:.3},0,1)'", c0, c1, c0, k0.time_sec, dt);
+        let s_expr = format!("'{:.3}+({:.3}-({:.3}))*clip((t-{:.3})/{:.3},0,1)'", s0, s1, s0, k0.time_sec, dt);
+
+        filters.push(format!("eq=brightness={}:contrast={}:saturation={}", b_expr, c_expr, s_expr));
+    } else {
+        let b = (base_fx.brightness - 100.0) / 100.0;
+        let c = base_fx.contrast / 100.0;
+        let s = base_fx.saturation / 100.0;
+        if b.abs() > 0.01 || (c - 1.0).abs() > 0.01 || (s - 1.0).abs() > 0.01 {
+            filters.push(format!("eq=brightness={:.3}:contrast={:.3}:saturation={:.3}", b, c, s));
+        }
+    }
+
+    if base_fx.blur_px > 0.1 {
+        filters.push(format!("boxblur={:.1}:1", base_fx.blur_px.min(25.0)));
+    }
+
+    filters.join(",")
 }

@@ -14,9 +14,9 @@ use media_engine::{
     process_and_export_audio, validate_video_export, AspectRatioPreset, ContainerFormat,
     EasingCurve, FramingMode, MaskType, MusicTrackItem, OverlayTrackItem, ProjectSettings,
     ResolutionPreset, TextOverlayItem, TimelineClip, TransitionType, VideoAudioCodec, VideoCodec,
-    VideoExportSettings, VideoFxParams, VideoKeyframe, VideoLook,
+    build_dynamic_ffmpeg_filter, evaluate_keyframed_params, EffectKeyframe, VideoExportSettings, VideoFxParams, VideoKeyframe, VideoLook,
 };
-use ofx_host::{default_ofx_search_paths, inspect_ofx_binary, scan_ofx_directories, OfxPluginInfo};
+use ofx_host::{default_ofx_searchpaths, inspect_ofx_binary, scan_ofx_directories, OfxPluginInfo};
 use std::path::PathBuf;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -73,7 +73,7 @@ struct GrainStudioApp {
     lib_page: LibraryPage,
 
     // Audio Mode State
-    audio_path: Option<PathBuf>,
+    audiopath: Option<PathBuf>,
     audio_filename: String,
     audio_duration_sec: f64,
     audio_sr: u32,
@@ -101,11 +101,12 @@ struct GrainStudioApp {
 
     // Keyframe & Curve Editor State
     keyframes: Vec<VideoKeyframe>,
-    selected_easing: EasingCurve,
+    effect_keyframes: Vec<EffectKeyframe>,
+    selectedeasing: EasingCurve,
 
     // Vegas Pro 15 Timeline Controls
     tl_zoom: f32,
-    snap_enabled: bool,
+    snapenabled: bool,
     playhead_sec: f64,
     is_playing: bool,
     source_res: (u32, u32),
@@ -140,7 +141,7 @@ impl Default for GrainStudioApp {
         Self {
             mode: AppMode::Video,
             lib_page: LibraryPage::Effects,
-            audio_path: None,
+            audiopath: None,
             audio_filename: "No file loaded".into(),
             audio_duration_sec: 0.0,
             audio_sr: 48_000,
@@ -169,9 +170,10 @@ impl Default for GrainStudioApp {
             ofx_plugins,
             active_ofx_identifiers: Vec::new(),
             keyframes: Vec::new(),
-            selected_easing: EasingCurve::InOutCubic,
+            effect_keyframes: Vec::new(),
+            selectedeasing: EasingCurve::InOutCubic,
             tl_zoom: 60.0,
-            snap_enabled: true,
+            snapenabled: true,
             playhead_sec: 0.0,
             is_playing: false,
             source_res: (1920, 1080),
@@ -265,7 +267,7 @@ impl GrainStudioApp {
                     self.audio_peaks_l = compute_waveform_peaks(&l, 420);
                     self.audio_peaks_r = compute_waveform_peaks(&r, 420);
                     self.audio_filename = name.clone();
-                    self.audio_path = Some(path);
+                    self.audiopath = Some(path);
                     self.set_status(
                         format!(
                             "{} — {:.2}s, {} Hz, 2 ch",
@@ -281,20 +283,20 @@ impl GrainStudioApp {
 
     fn run_audio_process(&mut self) {
         // Clone PathBuf so `self` is not borrowed immutably during `self.set_status(...)`
-        let Some(in_path) = self.audio_path.clone() else {
+        let Some(inpath) = self.audiopath.clone() else {
             self.set_status("Load an audio file first.", true);
             return;
         };
         let ext = self.audio_state.export_format.ext();
-        let default_name = format!("processed.{}", ext);
-        if let Some(out_path) = rfd::FileDialog::new()
-            .set_file_name(&default_name)
+        let defaultname = format!("processed.{}", ext);
+        if let Some(outpath) = rfd::FileDialog::new()
+            .set_file_name(&defaultname)
             .add_filter(ext.to_uppercase(), &[ext])
             .save_file()
         {
             self.progress_pct = Some(15.0);
             self.set_status("Processing audio DSP... 15%", false);
-            match process_and_export_audio(&in_path, &out_path, &self.audio_state) {
+            match process_and_export_audio(&inpath, &outpath, &self.audio_state) {
                 Ok(msg) => {
                     self.progress_pct = Some(100.0);
                     self.set_status(format!("{} (100%)", msg), false);
@@ -425,6 +427,7 @@ impl GrainStudioApp {
             }
         }
         self.keyframes.clear();
+        self.effect_keyframes.clear();
         self.text_overlays.clear();
         self.active_ofx_identifiers.clear();
         self.set_status("Reset all effects, curves, wheels, and keyframes to neutral.", false);
@@ -440,9 +443,9 @@ impl GrainStudioApp {
             return;
         }
         let ext = self.video_export.container.ext();
-        let default_name = format!("{}.{}", self.project.name.replace(' ', "_"), ext);
-        if let Some(out_path) = rfd::FileDialog::new()
-            .set_file_name(&default_name)
+        let defaultname = format!("{}.{}", self.project.name.replace(' ', "_"), ext);
+        if let Some(outpath) = rfd::FileDialog::new()
+            .set_file_name(&defaultname)
             .add_filter(ext.to_uppercase(), &[ext])
             .save_file()
         {
@@ -453,7 +456,7 @@ impl GrainStudioApp {
                 &self.text_overlays,
                 &self.project,
                 &self.video_export,
-                &out_path,
+                &outpath,
             ) {
                 Ok(msg) => {
                     self.progress_pct = Some(100.0);
@@ -1217,11 +1220,11 @@ impl GrainStudioApp {
 
                     ui.separator();
                     ui.label("Keyframe easing (from this key to the next)");
-                    egui::ComboBox::from_id_salt("kf_easing_box")
-                        .selected_text(self.selected_easing.label())
+                    egui::ComboBox::from_id_salt("kfeasing_box")
+                        .selected_text(self.selectedeasing.label())
                         .show_ui(ui, |ui| {
                             for &ec in EasingCurve::ALL {
-                                ui.selectable_value(&mut self.selected_easing, ec, ec.label());
+                                ui.selectable_value(&mut self.selectedeasing, ec, ec.label());
                             }
                         });
 
@@ -1239,7 +1242,7 @@ impl GrainStudioApp {
                     let mut pts = Vec::with_capacity(51);
                     for i in 0..=50 {
                         let t = i as f32 / 50.0;
-                        let y_val = self.selected_easing.eval(t);
+                        let y_val = self.selectedeasing.eval(t);
                         let px = curve_rect.left() + 12.0 + t * (curve_rect.width() - 24.0);
                         let py = curve_rect.bottom() - 24.0 - y_val * (curve_rect.height() - 48.0);
                         pts.push(egui::pos2(px, py));
@@ -1256,7 +1259,7 @@ impl GrainStudioApp {
                                 if let Some(c) = self.clips.get(idx) {
                                     self.keyframes.push(VideoKeyframe {
                                         time_sec: self.playhead_sec,
-                                        easing: self.selected_easing,
+                                        easing: self.selectedeasing,
                                         brightness: c.fx.brightness,
                                         contrast: c.fx.contrast,
                                         saturation: c.fx.saturation,
@@ -1269,7 +1272,7 @@ impl GrainStudioApp {
                                         format!(
                                             "Added keyframe @ {:.2}s ({})",
                                             self.playhead_sec,
-                                            self.selected_easing.label()
+                                            self.selectedeasing.label()
                                         ),
                                         false,
                                     );
@@ -1278,11 +1281,19 @@ impl GrainStudioApp {
                         }
                         if ui.button("Clear keyframes").clicked() {
                             self.keyframes.clear();
+        self.effect_keyframes.clear();
                             self.set_status("Cleared all keyframes.", false);
                         }
                     });
                     if !self.keyframes.is_empty() {
-                        ui.label(format!("Active keyframes: {}", self.keyframes.len()));
+                        let _active_fx = if !self.effect_keyframes.is_empty() {
+                        evaluate_keyframed_params(&self.effect_keyframes, self.playhead_sec)
+                    } else if let Some(idx) = self.selected_clip_idx {
+                        self.clips.get(idx).map(|c| c.fx.clone()).unwrap_or_default()
+                    } else {
+                        VideoFxParams::default()
+                    };
+                    ui.label(format!("Active keyframes: {} • Glow: {:.0}% • Blur: {:.1}px", self.effect_keyframes.len(), _active_fx.glow.max(_active_fx.s_glow), _active_fx.blur_px));
                     }
                 });
             });
@@ -1349,13 +1360,13 @@ impl GrainStudioApp {
                     if ui.button("Duplicate").clicked() {
                         self.duplicate_selected_clip();
                     }
-                    let snap_lbl = if self.snap_enabled {
+                    let snap_lbl = if self.snapenabled {
                         "Snap: on"
                     } else {
                         "Snap: off"
                     };
                     if ui.button(snap_lbl).clicked() {
-                        self.snap_enabled = !self.snap_enabled;
+                        self.snapenabled = !self.snapenabled;
                     }
                     ui.add(egui::Slider::new(&mut self.tl_zoom, 15.0..=180.0).text("Zoom"));
                     let exp_seq = egui::Button::new(
@@ -1523,6 +1534,13 @@ impl GrainStudioApp {
                     egui::Stroke::new(1.0_f32, egui::Color32::from_rgb(38, 42, 52)),
                 );
 
+                let _active_fx = if !self.effect_keyframes.is_empty() {
+                    evaluate_keyframed_params(&self.effect_keyframes, self.playhead_sec)
+                } else if let Some(idx) = self.selected_clip_idx {
+                    self.clips.get(idx).map(|c| c.fx.clone()).unwrap_or_default()
+                } else {
+                    VideoFxParams::default()
+                };
                 if let Some(idx) = self.selected_clip_idx {
                     if let Some(c) = self.clips.get(idx) {
                         p.text(
@@ -1536,11 +1554,11 @@ impl GrainStudioApp {
                             egui::pos2(mon_rect.center().x, mon_rect.center().y + 10.0),
                             egui::Align2::CENTER_CENTER,
                             format!(
-                                "Aspect: {} ({}) • Color: {} • Keyframes: {}",
+                                "Aspect: {} ({}) • Color: {} • Effect KFs: {} • Glow: {:.0}% • Blur: {:.1}px",
                                 self.project.aspect.label(),
                                 self.project.framing.label(),
                                 self.project.color_space,
-                                self.keyframes.len()
+                                self.effect_keyframes.len(), _active_fx.glow.max(_active_fx.s_glow), _active_fx.blur_px
                             ),
                             egui::FontId::proportional(11.5),
                             egui::Color32::GRAY,
@@ -1662,9 +1680,35 @@ impl GrainStudioApp {
             ui.label("Search:");
             ui.text_edit_singleline(&mut self.effect_search);
         });
-        if ui.button("Reset to none").clicked() {
-            self.reset_effects_to_none();
-        }
+        ui.horizontal(|ui| {
+            if ui.button("Reset to none").clicked() {
+                self.reset_effects_to_none();
+            }
+            if ui.button("◆ Keyframe Effect").clicked() {
+                let _active_fx = if !self.effect_keyframes.is_empty() {
+                    evaluate_keyframed_params(&self.effect_keyframes, self.playhead_sec)
+                } else if let Some(idx) = self.selected_clip_idx {
+                    self.clips.get(idx).map(|c| c.fx.clone()).unwrap_or_default()
+                } else {
+                    VideoFxParams::default()
+                };
+                if let Some(idx) = self.selected_clip_idx {
+                    if let Some(c) = self.clips.get(idx) {
+                        self.effect_keyframes.push(EffectKeyframe {
+                            time_sec: self.playhead_sec,
+                            easing: self.selectedeasing,
+                            params: c.fx.clone(),
+                        });
+                        self.effect_keyframes.sort_by(|a, b| a.time_sec.partial_cmp(&b.time_sec).unwrap_or(std::cmp::Ordering::Equal));
+                        let dyn_ff = build_dynamic_ffmpeg_filter(&self.effect_keyframes, &c.fx);
+                        self.set_status(
+                            format!("Keyframed effect @ {:.2}s ({}) | FFmpeg+++: {}", self.playhead_sec, self.selectedeasing.label(), dyn_ff),
+                            false,
+                        );
+                    }
+                }
+            }
+        });
         ui.add_space(4.0);
 
         let Some(idx) = self.selected_clip_idx else {
@@ -1783,11 +1827,11 @@ impl GrainStudioApp {
         // BorisFX Sapphire S_ Blur & Distort / Warps
         if show("sapphire blur distort warp s_warpwaves2 s_warpperspective s_warpfisheye s_warpmagnify s_warppolar s_warpbubble2 s_warpvortex s_warpchroma s_warppuddle s_warptransform s_warppuff s_blurdirectional s_blurradial s_blurmotion s_rackdefocus s_zblur s_edgeblur s_beauty") {
             ui.collapsing("BorisFX Sapphire: Blur & Distort (S_)", |ui| {
-                ui.checkbox(&mut fx.waves_enabled, "S_WarpWaves2 (enable)");
+                ui.checkbox(&mut fx.wavesenabled, "S_WarpWaves2 (enable)");
                 ui.add(egui::Slider::new(&mut fx.wave_a_amp, -1.0..=1.0).text("S_WarpWaves2 A amplitude"));
                 ui.add(egui::Slider::new(&mut fx.wave_a_freq, 0.1..=40.0).text("S_WarpWaves2 A frequency"));
                 ui.add(egui::Slider::new(&mut fx.wave_b_amp, -1.0..=1.0).text("S_WarpWaves2 B amplitude"));
-                ui.checkbox(&mut fx.perspective_enabled, "S_WarpPerspective (enable)");
+                ui.checkbox(&mut fx.perspectiveenabled, "S_WarpPerspective (enable)");
                 ui.add(egui::Slider::new(&mut fx.persp_lat, -89.0..=89.0).text("S_WarpPerspective Latitude (°)"));
                 ui.add(egui::Slider::new(&mut fx.persp_swing, -360.0..=360.0).text("S_WarpPerspective Swing (°)"));
                 ui.add(egui::Slider::new(&mut fx.persp_roll, -360.0..=360.0).text("S_WarpPerspective Roll (°)"));
@@ -1869,7 +1913,7 @@ impl GrainStudioApp {
 
         if show("tv simulator crt curvature scanlines phosphor bloom bleed noise") {
             ui.collapsing("TV simulator (CRT)", |ui| {
-                ui.checkbox(&mut fx.crt_enabled, "Enable CRT Simulator");
+                ui.checkbox(&mut fx.crtenabled, "Enable CRT Simulator");
                 ui.add(egui::Slider::new(&mut fx.crt_curvature, 0.0..=1.0).text("Screen curvature"));
                 ui.add(egui::Slider::new(&mut fx.crt_scanlines, 0.0..=1.0).text("Scanline strength"));
                 ui.add(egui::Slider::new(&mut fx.crt_phosphor, 0.0..=1.0).text("RGB phosphor mask"));
@@ -1998,7 +2042,7 @@ impl GrainStudioApp {
 
         ui.add_space(6.0);
         ui.collapsing("Search Paths (/Library/OFX/Plugins & OFX_PLUGIN_PATH)", |ui| {
-            for p in default_ofx_search_paths() {
+            for p in default_ofx_searchpaths() {
                 ui.label(format!("• {}", p.display()));
             }
             for p in &self.ofx_extra_dirs {
@@ -2025,8 +2069,8 @@ impl GrainStudioApp {
                     });
                     ui.small(format!(
                         "Bundle: {} | API: {} v{} | Plugin v{}.{}",
-                        plug.bundle_name,
-                        plug.api_name,
+                        plug.bundlename,
+                        plug.apiname,
                         plug.api_version,
                         plug.version_major,
                         plug.version_minor

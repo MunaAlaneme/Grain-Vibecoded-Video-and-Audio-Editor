@@ -1,0 +1,7 @@
+OfxGetNumberOfPlugins - start();
+{
+}OfxGetNumberOfPlugins - stop;
+OfxGetPlugin - start();
+{
+  asking for 0th plugin;
+}OfxGetPlugin - stop;
