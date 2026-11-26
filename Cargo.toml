@@ -1,27 +1,18 @@
 [package]
-name = "grain-video-editor"
-version = "0.6.3"
+name = "vegas-ui-reference"
+version = "0.1.0"
 edition = "2021"
-description = "Grain Video & Audio Editor — Complete 100% Pure Rust Port + OpenFX (.ofx.bundle) Host + Full BorisFX Sapphire S_ Suite"
 authors = ["Grain"]
+description = "Vegas Pro 17 UI reference shell in pure Rust + egui 0.29 (matches the three reference screenshots)"
 
 [dependencies]
+# Pinned to the SAME versions used by the Grain Video Editor project
+# (see Cargo.lock: egui 0.29.1, eframe 0.29). This file drops straight in.
 eframe = { version = "0.29", default-features = true }
 egui = "0.29"
-rfd = "0.15"
-hound = "3.5"
-rustfft = "6.2"
-libloading = "0.8"
-
-[package.metadata.bundle]
-name = "Grain Video Editor"
-identifier = "com.grain.videoeditor"
-icon = ["assets/icons/icon.icns", "assets/icons/128x128@2x.png"]
-version = "0.6.3"
-copyright = "Copyright (c) Grain"
-category = "public.app-category.video"
-short_description = "Native Rust Video & Audio Studio + OpenFX Host for Apple Silicon"
-long_description = "100% Pure Rust desktop video and audio editor with native OpenFX (.ofx.bundle) plugin host, full BorisFX Sapphire S_ suite, and macOS VideoToolbox."
+# PNG decoding for the embedded Grain logo + splash background (include_bytes!).
+# Only the png decoder is enabled to keep the dependency footprint small.
+image = { version = "0.25", default-features = false, features = ["png"] }
 
 [profile.release]
 opt-level = 3

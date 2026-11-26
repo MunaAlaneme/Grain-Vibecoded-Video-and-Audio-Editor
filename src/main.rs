@@ -1,2407 +1,2375 @@
+// Vegas Pro 17 UI reference shell — pure Rust + egui 0.29
+//
+// Reproduces the chrome and layout shown in the three reference screenshots:
+//   shot 1 -> the "Video FX" docked window (search box, "All" folder tree,
+//             BCC+ plug-in list with blue FX badges, "Preset:" pane, bottom
+//             tab bar: Project Media | Explorer | Transitions | Video FX | Project Notes)
+//   shot 2 -> the Video Preview window (black canvas, transport, project info)
+//             and the Master Bus mixer (vertical fader + dB meter scale)
+//   shot 3 -> the multi-track timeline (big timecode readout, ruler with
+//             timecode ticks, track headers with volume/pan/VU meters, event
+//             clips + waveforms, playhead, bottom transport toolbar)
+//
+// This is a self-contained UI shell: it uses representative sample data so the
+// whole interface renders and is interactive (scrub the timeline, play/pause,
+// switch dock tabs, search FX, toggle tracks). It is meant as a faithful
+// visual + structural reference to drop the styling/layout into the existing
+// Grain Video Editor (eframe 0.29 / egui 0.29).
+
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+// egui 0.29 deprecates `Ui::allocate_ui_at_rect` in favor of `allocate_new_ui`,
+// but `allocate_new_ui` places by size+cursor, not by absolute Rect. This shell
+// positions dock panes, the preview sub-panels and the timeline columns at
+// explicit rects, so `allocate_ui_at_rect` is the correct tool here. The call
+// still works in 0.29; we silence the deprecation rather than distort the layout.
+#![allow(deprecated)]
 
-mod audio_dsp;
-mod media_engine;
-mod elastique_cli;
-mod ofx_host;
-
-use audio_dsp::{
-    AudioExportFormat, AudioLabState, AudioTab, CarrierWave, MoreFxType, StretchTech,
-    StudioFxType, TremoloWave,
-};
 use eframe::egui;
-use media_engine::{
-    check_ffmpeg, decode_audio_stereo, export_video_sequence, probe_media_info,
-    process_and_export_audio, validate_video_export, AspectRatioPreset, ContainerFormat,
-    EasingCurve, FramingMode, MaskType, MusicTrackItem, OverlayTrackItem, ProjectSettings,
-    ResolutionPreset, TextOverlayItem, TimelineClip, TransitionType, VideoAudioCodec, VideoCodec,
-    build_dynamic_ffmpeg_filter, evaluate_keyframed_params, extract_video_frame_rgba, EffectKeyframe, VideoExportSettings, VideoFxParams, VideoKeyframe, VideoLook,
-};
-use ofx_host::{default_ofx_searchpaths, inspect_ofx_binary, scan_ofx_directories, OfxPluginInfo};
-use std::path::PathBuf;
+use egui::{pos2, vec2, Color32, FontId, Rect, Rounding, Sense, Stroke, Ui, Vec2};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum AppMode {
-    Audio,
+// ===========================================================================
+// Vegas Pro 17 palette (sampled from the three reference screenshots)
+// ===========================================================================
+
+const TITLE_BAR: Color32 = Color32::from_rgb(13, 13, 13);       // #0D0D0D
+const MENU_BAR: Color32 = Color32::from_rgb(43, 43, 43);        // #2B2B2B
+const TOOLBAR: Color32 = Color32::from_rgb(58, 58, 58);         // #3A3A3A
+const PANEL_DARK: Color32 = Color32::from_rgb(37, 37, 37);      // #252525
+const LIST_BG: Color32 = Color32::from_rgb(30, 30, 30);         // #1E1E1E
+const PRESET_BG: Color32 = Color32::from_rgb(42, 42, 42);       // #2A2A2A
+const TAB_INACTIVE: Color32 = Color32::from_rgb(51, 51, 51);    // #333333
+const TAB_ACTIVE: Color32 = Color32::from_rgb(61, 61, 61);      // #3D3D3D
+const CANVAS_BLACK: Color32 = Color32::from_rgb(0, 0, 0);       // #000000
+const FX_BLUE: Color32 = Color32::from_rgb(59, 123, 191);       // #3B7BBF (FX badge)
+const ACCENT_BLUE: Color32 = Color32::from_rgb(26, 111, 212);   // #1A6FD4 (title bar / play highlights)
+const ORANGE: Color32 = Color32::from_rgb(230, 126, 34);        // numeric readouts
+const RED_REC: Color32 = Color32::from_rgb(196, 64, 58);        // record button / red event header
+const TEXT_LIGHT: Color32 = Color32::from_rgb(208, 208, 208);   // #D0D0D0
+const TEXT_DIM: Color32 = Color32::from_rgb(139, 146, 161);     // secondary text
+const TEXT_WHITE: Color32 = Color32::from_rgb(238, 238, 238);
+const TRACK_VIDEO: Color32 = Color32::from_rgb(74, 85, 104);    // slate-blue video track bg
+const TRACK_AUDIO_OLIVE: Color32 = Color32::from_rgb(110, 102, 56);
+const TRACK_AUDIO_TEAL: Color32 = Color32::from_rgb(40, 104, 116);
+const TRACK_AUDIO_GREEN: Color32 = Color32::from_rgb(58, 116, 70);
+const EVENT_HEADER_RED: Color32 = Color32::from_rgb(150, 44, 44);
+const RULER_BG: Color32 = Color32::from_rgb(45, 45, 45);
+const GRID_LINE: Color32 = Color32::from_rgb(58, 58, 58);
+const PLAYHEAD: Color32 = Color32::from_rgb(240, 240, 240);
+fn loop_region_color() -> Color32 {
+    Color32::from_rgba_unmultiplied(220, 190, 70, 60)
+}
+
+// ===========================================================================
+// Data model (representative sample data matching screenshot 3)
+// ===========================================================================
+
+#[derive(Clone, Copy, PartialEq)]
+enum TrackKind {
     Video,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum LibraryPage {
-    Media,
-    Effects,
-    Transitions,
-    Text,
-    Adjust,
-    OpenFx,
-    Export,
-}
-
-impl LibraryPage {
-    const ALL: &'static [LibraryPage] = &[
-        LibraryPage::Media,
-        LibraryPage::Effects,
-        LibraryPage::Transitions,
-        LibraryPage::Text,
-        LibraryPage::Adjust,
-        LibraryPage::OpenFx,
-        LibraryPage::Export,
-    ];
-
-    fn label(&self) -> &'static str {
-        match self {
-            LibraryPage::Media => "Media",
-            LibraryPage::Effects => "Effects",
-            LibraryPage::Transitions => "Transitions",
-            LibraryPage::Text => "Text",
-            LibraryPage::Adjust => "Adjust",
-            LibraryPage::OpenFx => "OpenFX",
-            LibraryPage::Export => "Export",
-        }
-    }
+    Audio,
 }
 
 #[derive(Clone)]
-struct TimelineSnapshot {
-    clips: Vec<TimelineClip>,
-    overlays: Vec<OverlayTrackItem>,
-    music: Vec<MusicTrackItem>,
-    texts: Vec<TextOverlayItem>,
+struct TlEvent {
+    name: String,
+    start_sec: f64,
+    dur_sec: f64,
+    color: Color32,        // event body color
+    header: Color32,       // event header strip color
+    waveform: bool,        // audio -> draw waveform; video -> draw thumbnails
+    gain: Option<f32>,     // floating gain box like "+0.500"
 }
 
-struct GrainStudioApp {
-    mode: AppMode,
-    lib_page: LibraryPage,
+#[derive(Clone)]
+struct Track {
+    name: String,
+    kind: TrackKind,
+    bg: Color32,
+    volume_db: f32,
+    pan: f32,       // -1..1, 0 == Center
+    muted: bool,
+    solo: bool,
+    height: f32,
+    events: Vec<TlEvent>,
+}
 
-    // Audio Mode State
-    audiopath: Option<PathBuf>,
-    audio_filename: String,
-    audio_duration_sec: f64,
-    audio_sr: u32,
-    audio_peaks_l: Vec<(f32, f32)>,
-    audio_peaks_r: Vec<(f32, f32)>,
-    audio_playhead_frac: f32,
-    audio_state: AudioLabState,
+#[derive(Clone, Copy, PartialEq)]
+enum DockTab {
+    ProjectMedia,
+    Explorer,
+    Transitions,
+    VideoFx,
+    ProjectNotes,
+}
+impl DockTab {
+    const ALL: &'static [DockTab] = &[
+        DockTab::ProjectMedia,
+        DockTab::Explorer,
+        DockTab::Transitions,
+        DockTab::VideoFx,
+        DockTab::ProjectNotes,
+    ];
+    fn label(self) -> &'static str {
+        match self {
+            DockTab::ProjectMedia => "Project Media",
+            DockTab::Explorer => "Explorer",
+            DockTab::Transitions => "Transitions",
+            DockTab::VideoFx => "Video FX",
+            DockTab::ProjectNotes => "Project Notes",
+        }
+    }
+}
 
-    // Video Mode State
-    project: ProjectSettings,
-    show_project_modal: bool,
-    effect_search: String,
+// App start-up phases: a brief branded splash, then a loading screen, then the
+// full workspace. Timers are driven by `stable_dt` so they are frame-rate
+// independent.
+#[derive(Clone, Copy, PartialEq)]
+enum AppPhase {
+    Splash,
+    Loading,
+    Ready,
+}
 
-    clips: Vec<TimelineClip>,
-    selected_clip_idx: Option<usize>,
-    overlays: Vec<OverlayTrackItem>,
-    music_tracks: Vec<MusicTrackItem>,
-    text_overlays: Vec<TextOverlayItem>,
-    draft_text: TextOverlayItem,
+// Marlett glyph code points. Marlett is a Windows system font whose glyphs live
+// at these ASCII code points (not Unicode symbol blocks). We try to load the
+// real font at runtime; if it is unavailable we draw equivalent shapes.
+#[derive(Clone, Copy, PartialEq)]
+enum MarlettGlyph {
+    Minimize, // '0'
+    Maximize, // '1'
+    #[allow(dead_code)] // Marlett code point '2'; not wired to a button yet
+    Restore,  // '2'
+    Close,    // 'r'
+}
 
-    // OpenFX (OFX 1.4/1.5) Host State
-    ofx_extra_dirs: Vec<PathBuf>,
-    ofx_plugins: Vec<OfxPluginInfo>,
-    active_ofx_identifiers: Vec<String>,
+/// The BorisFX Continuum plug-in list exactly as read in screenshot 1.
+const BCC_FX_LIST: &[&str] = &[
+    "BCC+Ambient Light",
+    "BCC+Atmospheric Glow",
+    "BCC+Beauty Studio",
+    "BCC+Black and White",
+    "BCC+Bleach Bypass",
+    "BCC+Blur",
+    "BCC+Borders",
+    "BCC+Camera Shake",
+    "BCC+Center Spot",
+    "BCC+Channel Blur",
+    "BCC+Channel Blur YUV",
+    "BCC+Chroma Bands",
+    "BCC+Chromatic Aberration",
+    "BCC+Color Gradient",
+    "BCC+Color Infrared",
+    "BCC+Color Paste",
+    "BCC+Color Shadow",
+    "BCC+Color Spot",
+    "BCC+Colorize Gradient",
+    "BCC+Colorama",
+    "BCC+Compound Blur",
+    "BCC+Contrast",
+    "BCC+Convert to HDR",
+    "BCC+Cross Process",
+    "BCC+Day for Night",
+    "BCC+Defocus",
+    "BCC+Depth of Field",
+    "BCC+Deband",
+    "BCC+Dielectric",
+    "BCC+Diffusion",
+    "BCC+Digital Garbage Matte",
+    "BCC+Dissolve",
+    "BCC+Drop Shadow",
+    "BCC+Edge Lighting",
+    "BCC+Emboss",
+    "BCC+Exposure Blend",
+    "BCC+Faux Film",
+    "BCC+Film Glow",
+    "BCC+Film Grain",
+    "BCC+Film Process",
+    "BCC+Glow",
+    "BCC+Glow Edge",
+    "BCC+Gradient",
+    "BCC+Halo",
+    "BCC+Halation",
+    "BCC+Highlights",
+    "BCC+Hot Spot",
+    "BCC+HSL Curves",
+    "BCC+Invert",
+    "BCC+Luma Key",
+    "BCC+Magic Sharp",
+    "BCC+Matte Cleanup",
+    "BCC+Mosaic",
+    "BCC+Motion Blur",
+    "BCC+Neon Edges",
+    "BCC+Noise",
+    "BCC+Old Film",
+    "BCC+Optical Stabilizer",
+    "BCC+Pin Art",
+    "BCC+Pixelator",
+    "BCC+Posterize",
+    "BCC+Priority Blur",
+    "BCC+Prism",
+    "BCC+Pseudo Color",
+    "BCC+Radial Blur",
+    "BCC+Rays",
+    "BCC+Reptile",
+    "BCC+Selective Bloom",
+    "BCC+Selective Gaussian",
+    "BCC+Selective Tint",
+    "BCC+Shadows",
+    "BCC+Sharpen",
+    "BCC+Show Hide Alpha",
+    "BCC+Skin Tone",
+    "BCC+Sky Designer",
+    "BCC+Slide",
+    "BCC+Smear",
+    "BCC+Snow",
+    "BCC+Solarize",
+    "BCC+Sparkle",
+    "BCC+Stabilize",
+    "BCC+Star",
+    "BCC+Star Filter",
+    "BCC+Tic Tac Toe",
+    "BCC+Tile",
+    "BCC+Title Studio",
+    "BCC+Tone",
+    "BCC+Tritone",
+    "BCC+Twirl",
+    "BCC+Undulate",
+    "BCC+Vignette",
+    "BCC+Warp",
+    "BCC+Wave",
+    "BCC+Wedge",
+    "BCC+Zonal",
+];
 
-    // Keyframe & Curve Editor State
-    keyframes: Vec<VideoKeyframe>,
-    effect_keyframes: Vec<EffectKeyframe>,
-    selectedeasing: EasingCurve,
+// ===========================================================================
+// App
+// ===========================================================================
 
-    // Vegas Pro 15 Timeline Controls & Real-Time Preview State
-    tl_zoom: f32,
-    snapenabled: bool,
+struct VegasApp {
+    // dock / library state
+    dock_tab: DockTab,
+    fx_search: String,
+    selected_fx: Option<String>,
+    show_all_folder: bool,
+    notes: String,
+
+    // layout visibility (View menu)
+    show_dock: bool,
+    show_mixer: bool,
+    show_preview: bool,
+
+    // timeline state
+    tracks: Vec<Track>,
+    tl_zoom: f32,        // pixels per second
     playhead_sec: f64,
     is_playing: bool,
-    audio_is_playing: bool,
-    ffplay_child: Option<std::process::Child>,
-    preview_texture: Option<egui::TextureHandle>,
-    last_preview_sec: f64,
-    last_preview_clip_idx: Option<usize>,
-    last_preview_fx_sig: String,
-    selected_ofx_plugin_idx: usize,
-    source_res: (u32, u32),
-    undo_stack: Vec<TimelineSnapshot>,
-    redo_stack: Vec<TimelineSnapshot>,
+    selected_track: Option<usize>,
+    loop_start: f64,
+    loop_end: f64,
+    snap: bool,
 
-    // Export Settings
-    video_export: VideoExportSettings,
+    // mixer / master bus
+    master_db: f32,
+    master_level: f32,   // 0..1 simulated meter level
 
-    // Status Banner & Progress
-    status_text: String,
-    status_error: bool,
-    progress_pct: Option<f32>,
+    // project info (screenshot 2 readouts)
+    project_w: u32,
+    project_h: u32,
+    fps: f32,
+    preview_scale: f32,  // 0.25 -> "Preview: 480x270"
+    frame: u64,
+
+    status: String,
+
+    // --- start-up phases + brand assets ---------------------------------
+    phase: AppPhase,
+    phase_t: f32,        // seconds elapsed in the current phase
+    logo_tex: Option<egui::TextureHandle>,
+    splash_bg_tex: Option<egui::TextureHandle>,
+    marlett_loaded: bool, // true if a real Marlett TTF was registered
 }
 
-impl Default for GrainStudioApp {
+impl Default for VegasApp {
     fn default() -> Self {
-        let ffmpeg_available = check_ffmpeg();
-        let ofx_plugins = scan_ofx_directories(&[]);
-        let status_text = if ffmpeg_available {
-            format!(
-                "Ready — Pure Rust Studio ({} / {}) • {} OpenFX plugins detected • VideoToolbox Ready",
-                std::env::consts::OS,
-                std::env::consts::ARCH,
-                ofx_plugins.len()
-            )
-        } else {
-            "Warning: `ffmpeg` not found. Run `brew install ffmpeg` on macOS to enable hardware VideoToolbox export."
-                .into()
-        };
+        let tracks = vec![
+            Track {
+                name: "Video Track 1".into(),
+                kind: TrackKind::Video,
+                bg: TRACK_VIDEO,
+                volume_db: 0.0,
+                pan: 0.0,
+                muted: false,
+                solo: false,
+                height: 74.0,
+                events: vec![TlEvent {
+                    name: "novG40".into(),
+                    start_sec: 0.0,
+                    dur_sec: 1.7167, // 00:00:01.43 @ 60fps
+                    color: Color32::from_rgb(90, 110, 150),
+                    header: EVENT_HEADER_RED,
+                    waveform: false,
+                    gain: None,
+                }],
+            },
+            Track {
+                name: "Audio Track 1".into(),
+                kind: TrackKind::Audio,
+                bg: TRACK_AUDIO_OLIVE,
+                volume_db: 0.0,
+                pan: 0.0,
+                muted: false,
+                solo: false,
+                height: 60.0,
+                events: vec![TlEvent {
+                    name: "novG40".into(),
+                    start_sec: 0.0,
+                    dur_sec: 1.7167,
+                    color: Color32::from_rgb(140, 130, 70),
+                    header: Color32::from_rgb(120, 110, 55),
+                    waveform: true,
+                    gain: None,
+                }],
+            },
+            Track {
+                name: "Video Track 2".into(),
+                kind: TrackKind::Video,
+                bg: TRACK_AUDIO_TEAL,
+                volume_db: -2.0,
+                pan: 0.0,
+                muted: false,
+                solo: false,
+                height: 74.0,
+                events: vec![TlEvent {
+                    name: "cf813".into(),
+                    start_sec: 0.35,
+                    dur_sec: 1.4,
+                    color: Color32::from_rgb(60, 130, 140),
+                    header: Color32::from_rgb(45, 100, 110),
+                    waveform: false,
+                    gain: None,
+                }],
+            },
+            Track {
+                name: "Audio Track 2".into(),
+                kind: TrackKind::Audio,
+                bg: TRACK_AUDIO_GREEN,
+                volume_db: -3.0,
+                pan: 0.0,
+                muted: false,
+                solo: false,
+                height: 60.0,
+                events: vec![TlEvent {
+                    name: "cf813".into(),
+                    start_sec: 0.35,
+                    dur_sec: 1.4,
+                    color: Color32::from_rgb(80, 140, 90),
+                    header: Color32::from_rgb(60, 116, 70),
+                    waveform: true,
+                    gain: Some(0.5),
+                }],
+            },
+            Track {
+                name: "Audio Track 3".into(),
+                kind: TrackKind::Audio,
+                bg: Color32::from_rgb(50, 55, 65),
+                volume_db: -6.0,
+                pan: 0.2,
+                muted: true,
+                solo: false,
+                height: 52.0,
+                events: vec![],
+            },
+        ];
 
         Self {
-            mode: AppMode::Video,
-            lib_page: LibraryPage::Effects,
-            audiopath: None,
-            audio_filename: "No file loaded".into(),
-            audio_duration_sec: 0.0,
-            audio_sr: 48_000,
-            audio_peaks_l: Vec::new(),
-            audio_peaks_r: Vec::new(),
-            audio_playhead_frac: 0.0,
-            audio_state: AudioLabState::default(),
-            project: ProjectSettings::default(),
-            show_project_modal: false,
-            effect_search: String::new(),
-            clips: Vec::new(),
-            selected_clip_idx: None,
-            overlays: Vec::new(),
-            music_tracks: Vec::new(),
-            text_overlays: Vec::new(),
-            draft_text: TextOverlayItem {
-                text: "Your text".into(),
-                size_pct: 8.0,
-                x_pct: 50.0,
-                y_pct: 85.0,
-                start_sec: 0.0,
-                end_sec: 0.0,
-                color: [255, 255, 255],
-            },
-            ofx_extra_dirs: Vec::new(),
-            ofx_plugins,
-            active_ofx_identifiers: Vec::new(),
-            keyframes: Vec::new(),
-            effect_keyframes: Vec::new(),
-            selectedeasing: EasingCurve::InOutCubic,
-            tl_zoom: 60.0,
-            snapenabled: true,
-            playhead_sec: 0.0,
+            dock_tab: DockTab::VideoFx,
+            fx_search: String::new(),
+            selected_fx: Some("BCC+Ambient Light".into()),
+            show_all_folder: true,
+            notes: String::from("Project Notes\n\n- Rough cut v1\n- Color: BCC+Color Gradient\n- Export 1080p60"),
+
+            show_dock: true,
+            show_mixer: true,
+            show_preview: true,
+
+            tracks,
+            tl_zoom: 520.0,
+            playhead_sec: 0.55,    // ~00:00:00.33
             is_playing: false,
-            audio_is_playing: false,
-            ffplay_child: None,
-            preview_texture: None,
-            last_preview_sec: -1.0,
-            last_preview_clip_idx: None,
-            last_preview_fx_sig: String::new(),
-            selected_ofx_plugin_idx: 0,
-            source_res: (1920, 1080),
-            undo_stack: Vec::new(),
-            redo_stack: Vec::new(),
-            video_export: VideoExportSettings::default(),
-            status_text,
-            status_error: !ffmpeg_available,
-            progress_pct: None,
+            selected_track: Some(0),
+            loop_start: 0.0,
+            loop_end: 2.0,
+            snap: true,
+
+            master_db: 0.0,
+            master_level: 0.62,
+
+            project_w: 1920,
+            project_h: 1080,
+            fps: 60.0,
+            preview_scale: 0.25,
+            frame: 0,
+
+            status: "Ready — Vegas Pro 17 UI reference (pure Rust + egui)".into(),
+
+            phase: AppPhase::Splash,
+            phase_t: 0.0,
+            logo_tex: None,
+            splash_bg_tex: None,
+            marlett_loaded: false,
         }
     }
 }
 
-impl GrainStudioApp {
-
-    fn stop_playback_process(&mut self) {
-        if let Some(mut child) = self.ffplay_child.take() {
-            let _ = child.kill();
-            let _ = child.wait();
-        }
-        self.is_playing = false;
-        self.audio_is_playing = false;
+impl VegasApp {
+    fn set_status(&mut self, s: impl Into<String>) {
+        self.status = s.into();
     }
 
-    fn start_ffplay_audio(&mut self, path: &std::path::Path, start_sec: f64) {
-        self.stop_playback_process();
-        if let Ok(child) = std::process::Command::new("ffplay")
-            .args(["-nodisp", "-autoexit", "-loglevel", "quiet", "-ss"])
-            .arg(format!("{:.3}", start_sec.max(0.0)))
-            .arg(path)
-            .spawn()
-        {
-            self.ffplay_child = Some(child);
-            self.audio_is_playing = true;
-        } else {
-            self.set_status("Could not spawn ffplay for audio playback (`brew install ffmpeg`).", true);
-        }
-    }
-
-    fn start_ffplay_video_audio(&mut self, path: &std::path::Path, start_sec: f64) {
-        if let Some(mut child) = self.ffplay_child.take() {
-            let _ = child.kill();
-            let _ = child.wait();
-        }
-        if let Ok(child) = std::process::Command::new("ffplay")
-            .args(["-nodisp", "-autoexit", "-loglevel", "quiet", "-ss"])
-            .arg(format!("{:.3}", start_sec.max(0.0)))
-            .arg(path)
-            .spawn()
-        {
-            self.ffplay_child = Some(child);
-        }
-    }
-
-    fn compute_effective_preview_fx(&self, clip: &TimelineClip) -> VideoFxParams {
-        let mut fx = if !self.effect_keyframes.is_empty() {
-            evaluate_keyframed_params(&self.effect_keyframes, self.playhead_sec)
-        } else {
-            clip.fx.clone()
-        };
-        // Apply active OpenFX plugin properties into the live preview chain
-        for plug in &self.ofx_plugins {
-            if self.active_ofx_identifiers.contains(&plug.identifier) {
-                let mix = plug
-                    .params
-                    .iter()
-                    .find(|p| p.name == "mix")
-                    .map(|p| p.value / 100.0)
-                    .unwrap_or(1.0);
-                let intensity = plug
-                    .params
-                    .iter()
-                    .find(|p| p.name == "intensity")
-                    .map(|p| p.value)
-                    .unwrap_or(1.0);
-                let id_l = plug.identifier.to_lowercase();
-                if id_l.contains("glow") || id_l.contains("flare") || id_l.contains("light") {
-                    fx.s_glow = (fx.s_glow + 45.0 * mix * intensity).min(100.0);
-                } else if id_l.contains("blur") || id_l.contains("defocus") {
-                    let r = plug.params.iter().find(|p| p.name == "blur_amount").map(|p| p.value).unwrap_or(8.0);
-                    fx.blur_px = (fx.blur_px + r * mix * 0.4).min(20.0);
-                } else {
-                    fx.contrast = (fx.contrast + 12.0 * mix * intensity).min(200.0);
-                }
+    fn total_dur(&self) -> f64 {
+        let mut max = 0.0_f64;
+        for t in &self.tracks {
+            for e in &t.events {
+                max = max.max(e.start_sec + e.dur_sec);
             }
         }
-        fx
+        max.max(2.5)
     }
 
-    fn update_video_preview_texture(&mut self, ctx: &egui::Context) {
-        let Some(idx) = self.selected_clip_idx else {
-            return;
-        };
-        let Some(clip) = self.clips.get(idx).cloned() else {
-            return;
-        };
-        let target_time = (clip.trim_start_sec + self.playhead_sec * clip.speed as f64)
-            .clamp(clip.trim_start_sec, clip.trim_end_sec);
-
-        let eff_fx = self.compute_effective_preview_fx(&clip);
-        let pw = 480u32;
-        let ph = 270u32;
-        let fx_sig = media_engine::build_preview_vf_chain(&eff_fx, pw, ph);
-
-        if self.last_preview_clip_idx == Some(idx)
-            && (self.last_preview_sec - target_time).abs() < 0.04
-            && self.last_preview_fx_sig == fx_sig
-            && self.preview_texture.is_some()
-        {
+    // One-time-per-session asset init: registers the Marlett font (if it can be
+    // found on the host) and uploads the embedded Grain logo + splash background
+    // to the GPU as textures. Runs every frame but returns immediately once both
+    // textures exist, so the filesystem probes happen only on the first frame.
+    fn ensure_assets(&mut self, ctx: &egui::Context) {
+        if self.logo_tex.is_some() && self.splash_bg_tex.is_some() {
             return;
         }
+        // --- Marlett (Windows system font; not bundled — see README) ---------
+        self.marlett_loaded = false;
+        let mut fonts = egui::FontDefinitions::default();
+        for path in [
+            "assets/marlett.ttf",
+            "C:\\Windows\\Fonts\\marlett.ttf",
+            "/usr/share/fonts/marlett.ttf",
+            "/usr/share/fonts/truetype/marlett.ttf",
+        ] {
+            if let Ok(bytes) = std::fs::read(path) {
+                fonts
+                    .font_data
+                    .insert("Marlett".to_owned(), egui::FontData::from_owned(bytes));
+                fonts
+                    .families
+                    .entry(egui::FontFamily::Name("Marlett".into()))
+                    .or_default()
+                    .push("Marlett".to_owned());
+                self.marlett_loaded = true;
+                break;
+            }
+        }
+        ctx.set_fonts(fonts);
 
-        if let Ok(rgba) = extract_video_frame_rgba(&clip.path, target_time, pw, ph, &eff_fx) {
-            let img = egui::ColorImage::from_rgba_unmultiplied([pw as usize, ph as usize], &rgba);
-            let tex = ctx.load_texture("video_preview_frame", img, egui::TextureOptions::LINEAR);
-            self.preview_texture = Some(tex);
-            self.last_preview_sec = target_time;
-            self.last_preview_clip_idx = Some(idx);
-            self.last_preview_fx_sig = fx_sig;
+        // --- Grain brand textures (embedded at compile time) ---------------
+        if self.logo_tex.is_none() {
+            self.logo_tex = load_embedded_png(ctx, "grain_logo", include_bytes!("../assets/grain_logo.png"));
+        }
+        if self.splash_bg_tex.is_none() {
+            self.splash_bg_tex = load_embedded_png(ctx, "splash_bg", include_bytes!("../assets/splash_bg.png"));
         }
     }
 
-    fn set_status(&mut self, msg: impl Into<String>, err: bool) {
-        self.status_text = msg.into();
-        self.status_error = err;
-    }
-
-    fn snapshot(&self) -> TimelineSnapshot {
-        TimelineSnapshot {
-            clips: self.clips.clone(),
-            overlays: self.overlays.clone(),
-            music: self.music_tracks.clone(),
-            texts: self.text_overlays.clone(),
-        }
-    }
-
-    fn push_undo(&mut self) {
-        let s = self.snapshot();
-        self.undo_stack.push(s);
-        if self.undo_stack.len() > 60 {
-            self.undo_stack.remove(0);
-        }
-        self.redo_stack.clear();
-    }
-
-    fn undo(&mut self) {
-        if let Some(prev) = self.undo_stack.pop() {
-            self.redo_stack.push(self.snapshot());
-            self.clips = prev.clips;
-            self.overlays = prev.overlays;
-            self.music_tracks = prev.music;
-            self.text_overlays = prev.texts;
-            self.set_status("Undid timeline action.", false);
-        }
-    }
-
-    fn redo(&mut self) {
-        if let Some(next) = self.redo_stack.pop() {
-            self.undo_stack.push(self.snapshot());
-            self.clips = next.clips;
-            self.overlays = next.overlays;
-            self.music_tracks = next.music;
-            self.text_overlays = next.texts;
-            self.set_status("Redid timeline action.", false);
-        }
-    }
-
-    fn total_timeline_duration(&self) -> f64 {
-        let v_dur: f64 = self.clips.iter().map(|c| c.effective_duration()).sum();
-        let o_dur: f64 = self
-            .overlays
-            .iter()
-            .map(|o| o.start_sec + o.duration_sec)
-            .fold(0.0, f64::max);
-        let m_dur: f64 = self
-            .music_tracks
-            .iter()
-            .map(|m| m.start_sec + m.duration_sec)
-            .fold(0.0, f64::max);
-        v_dur.max(o_dur).max(m_dur).max(1.0)
-    }
-
-    fn import_audio_file(&mut self) {
-        if let Some(path) = rfd::FileDialog::new()
-            .add_filter(
-                "Audio / Video Media",
-                &["wav", "mp3", "flac", "ogg", "m4a", "aac", "mp4", "mov"],
+    // Full-screen branded splash (logo + "Grain" wordmark + tagline) and the
+    // subsequent loading screen (progress bar). Shown while phase != Ready.
+    fn render_splash_or_loading(&self, ctx: &egui::Context) {
+        let screen = ctx.screen_rect();
+        let uv = Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0));
+        egui::CentralPanel::default()
+            .frame(
+                egui::Frame::default()
+                    .fill(Color32::TRANSPARENT)
+                    .stroke(Stroke::NONE)
+                    .inner_margin(egui::Margin::ZERO)
+                    .outer_margin(egui::Margin::ZERO),
             )
-            .pick_file()
-        {
-            let name = path
-                .file_name()
-                .map(|n| n.to_string_lossy().to_string())
-                .unwrap_or_else(|| "Track".into());
-            match decode_audio_stereo(&path) {
-                Ok((l, r, sr)) => {
-                    self.audio_sr = sr;
-                    self.audio_duration_sec = l.len() as f64 / sr.max(1) as f64;
-                    self.audio_peaks_l = compute_waveform_peaks(&l, 420);
-                    self.audio_peaks_r = compute_waveform_peaks(&r, 420);
-                    self.audio_filename = name.clone();
-                    self.audiopath = Some(path);
-                    self.set_status(
-                        format!(
-                            "{} — {:.2}s, {} Hz, 2 ch",
-                            name, self.audio_duration_sec, sr
-                        ),
-                        false,
-                    );
-                }
-                Err(e) => self.set_status(e, true),
-            }
-        }
-    }
-
-    fn run_audio_process(&mut self) {
-        // Clone PathBuf so `self` is not borrowed immutably during `self.set_status(...)`
-        let Some(inpath) = self.audiopath.clone() else {
-            self.set_status("Load an audio file first.", true);
-            return;
-        };
-        let ext = self.audio_state.export_format.ext();
-        let defaultname = format!("processed.{}", ext);
-        if let Some(outpath) = rfd::FileDialog::new()
-            .set_file_name(&defaultname)
-            .add_filter(ext.to_uppercase(), &[ext])
-            .save_file()
-        {
-            self.progress_pct = Some(15.0);
-            self.set_status("Processing audio DSP... 15%", false);
-            match process_and_export_audio(&inpath, &outpath, &self.audio_state) {
-                Ok(msg) => {
-                    self.progress_pct = Some(100.0);
-                    self.set_status(format!("{} (100%)", msg), false);
-                }
-                Err(e) => {
-                    self.progress_pct = None;
-                    self.set_status(e, true);
-                }
-            }
-        }
-    }
-
-    fn import_video_clip(&mut self) {
-        if let Some(path) = rfd::FileDialog::new()
-            .add_filter("Video Files", &["mp4", "mov", "mkv", "webm", "avi", "m4v"])
-            .pick_file()
-        {
-            self.push_undo();
-            let (dur, w, h) = probe_media_info(&path);
-            if self.clips.is_empty() {
-                self.source_res = (w, h);
-            }
-            let name = path
-                .file_name()
-                .map(|n| n.to_string_lossy().to_string())
-                .unwrap_or_else(|| "Clip".into());
-            self.clips.push(TimelineClip {
-                path,
-                name: name.clone(),
-                duration_sec: dur,
-                trim_start_sec: 0.0,
-                trim_end_sec: dur,
-                speed: 1.0,
-                is_compound: false,
-                fx: VideoFxParams::default(),
-            });
-            self.selected_clip_idx = Some(self.clips.len() - 1);
-            self.set_status(format!("{} — {:.2}s, {}×{}", name, dur, w, h), false);
-        }
-    }
-
-    fn import_overlay_clip(&mut self) {
-        if let Some(path) = rfd::FileDialog::new()
-            .add_filter("Overlay Video", &["mp4", "mov", "mkv", "webm"])
-            .pick_file()
-        {
-            self.push_undo();
-            let (dur, _, _) = probe_media_info(&path);
-            let name = path
-                .file_name()
-                .map(|n| n.to_string_lossy().to_string())
-                .unwrap_or_else(|| "Overlay".into());
-            self.overlays.push(OverlayTrackItem {
-                path,
-                name: name.clone(),
-                duration_sec: dur,
-                start_sec: self.playhead_sec,
-                x_pct: 75.0,
-                y_pct: 75.0,
-                size_pct: 30.0,
-                opacity_pct: 100.0,
-            });
-            self.set_status(format!("Added V2 Overlay: {}", name), false);
-        }
-    }
-
-    fn import_music_clip(&mut self) {
-        if let Some(path) = rfd::FileDialog::new()
-            .add_filter("Audio Track", &["wav", "mp3", "flac", "ogg", "m4a", "aac"])
-            .pick_file()
-        {
-            self.push_undo();
-            let (dur, _, _) = probe_media_info(&path);
-            let name = path
-                .file_name()
-                .map(|n| n.to_string_lossy().to_string())
-                .unwrap_or_else(|| "Audio".into());
-            self.music_tracks.push(MusicTrackItem {
-                path,
-                name: name.clone(),
-                duration_sec: dur,
-                in_sec: 0.0,
-                start_sec: self.playhead_sec,
-                volume_pct: 60.0,
-            });
-            self.set_status(format!("Added A2 Music Track: {}", name), false);
-        }
-    }
-
-    fn split_selected_at_playhead(&mut self) {
-        let Some(idx) = self.selected_clip_idx else {
-            return;
-        };
-        if idx >= self.clips.len() {
-            return;
-        }
-        self.push_undo();
-        let c = self.clips[idx].clone();
-        let mid = (c.trim_start_sec + c.trim_end_sec) * 0.5;
-        if mid > c.trim_start_sec + 0.05 && mid < c.trim_end_sec - 0.05 {
-            let mut first = c.clone();
-            first.trim_end_sec = mid;
-            let mut second = c;
-            second.trim_start_sec = mid;
-            self.clips[idx] = first;
-            self.clips.insert(idx + 1, second);
-            self.selected_clip_idx = Some(idx + 1);
-            self.set_status("Split clip at playhead.", false);
-        }
-    }
-
-    fn duplicate_selected_clip(&mut self) {
-        let Some(idx) = self.selected_clip_idx else {
-            return;
-        };
-        if let Some(c) = self.clips.get(idx).cloned() {
-            self.push_undo();
-            self.clips.insert(idx + 1, c);
-            self.selected_clip_idx = Some(idx + 1);
-            self.set_status("Duplicated clip.", false);
-        }
-    }
-
-    fn reset_effects_to_none(&mut self) {
-        if let Some(idx) = self.selected_clip_idx {
-            if let Some(c) = self.clips.get_mut(idx) {
-                c.fx = VideoFxParams::default();
-            }
-        }
-        self.keyframes.clear();
-        self.effect_keyframes.clear();
-        self.text_overlays.clear();
-        self.active_ofx_identifiers.clear();
-        self.set_status("Reset all effects, curves, wheels, and keyframes to neutral.", false);
-    }
-
-    fn trigger_video_export(&mut self) {
-        if self.clips.is_empty() {
-            self.set_status("Add a clip first.", true);
-            return;
-        }
-        if let Err(err) = validate_video_export(&self.video_export) {
-            self.set_status(err, true);
-            return;
-        }
-        let ext = self.video_export.container.ext();
-        let defaultname = format!("{}.{}", self.project.name.replace(' ', "_"), ext);
-        if let Some(outpath) = rfd::FileDialog::new()
-            .set_file_name(&defaultname)
-            .add_filter(ext.to_uppercase(), &[ext])
-            .save_file()
-        {
-            self.progress_pct = Some(25.0);
-            self.set_status("Rendering & encoding video via Rust + VideoToolbox... 25%", false);
-            match export_video_sequence(
-                &self.clips,
-                &self.text_overlays,
-                &self.project,
-                &self.video_export,
-                &outpath,
-            ) {
-                Ok(msg) => {
-                    self.progress_pct = Some(100.0);
-                    self.set_status(format!("{} (100%)", msg), false);
-                }
-                Err(e) => {
-                    self.progress_pct = None;
-                    self.set_status(e, true);
-                }
-            }
-        }
-    }
-}
-
-fn compute_waveform_peaks(samples: &[f32], bins: usize) -> Vec<(f32, f32)> {
-    if samples.is_empty() || bins == 0 {
-        return Vec::new();
-    }
-    let step = (samples.len() / bins).max(1);
-    let mut out = Vec::with_capacity(bins);
-    for b in 0..bins {
-        let s0 = b * step;
-        if s0 >= samples.len() {
-            break;
-        }
-        let s1 = (s0 + step).min(samples.len());
-        let mut mn = 0.0f32;
-        let mut mx = 0.0f32;
-        for &v in &samples[s0..s1] {
-            if v < mn {
-                mn = v;
-            }
-            if v > mx {
-                mx = v;
-            }
-        }
-        out.push((mn, mx));
-    }
-    out
-}
-
-fn format_timecode(sec: f64) -> String {
-    let s = sec.max(0.0);
-    let mins = (s / 60.0).floor() as u64;
-    let rem = s - (mins as f64 * 60.0);
-    format!("{:02}:{:05.2}", mins, rem)
-}
-
-impl eframe::App for GrainStudioApp {
-    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        let mut visuals = egui::Visuals::dark();
-        visuals.panel_fill = egui::Color32::from_rgb(14, 16, 20);
-        visuals.window_fill = egui::Color32::from_rgb(22, 25, 32);
-        visuals.widgets.noninteractive.bg_fill = egui::Color32::from_rgb(28, 32, 40);
-        visuals.selection.bg_fill = egui::Color32::from_rgb(45, 212, 191);
-        visuals.selection.stroke = egui::Stroke::new(1.0_f32, egui::Color32::from_rgb(6, 32, 29));
-        ctx.set_visuals(visuals);
-
-        // Top Mode Bar: Grain | Audio | Video
-        egui::TopBottomPanel::top("grain_mode_bar").show(ctx, |ui| {
-            ui.add_space(5.0);
-            ui.horizontal(|ui| {
-                ui.label(
-                    egui::RichText::new("Grain")
-                        .size(16.0)
-                        .strong()
-                        .color(egui::Color32::from_rgb(232, 234, 239)),
-                );
-                ui.add_space(10.0);
-                ui.selectable_value(&mut self.mode, AppMode::Audio, "Audio");
-                ui.selectable_value(&mut self.mode, AppMode::Video, "Video");
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    ui.label(
-                        egui::RichText::new(format!(
-                            "100% Pure Rust • OpenFX 1.5 Host ({} plugins) • Apple Silicon M3",
-                            self.ofx_plugins.len()
-                        ))
-                        .small()
-                        .color(egui::Color32::from_rgb(139, 146, 161)),
-                    );
-                });
-            });
-            ui.add_space(5.0);
-        });
-
-        // Bottom Status Bar with Processing Percentage
-        egui::TopBottomPanel::bottom("grain_status_bar").show(ctx, |ui| {
-            ui.add_space(3.0);
-            ui.horizontal(|ui| {
-                let col = if self.status_error {
-                    egui::Color32::from_rgb(251, 113, 133)
-                } else {
-                    egui::Color32::from_rgb(45, 212, 191)
-                };
-                ui.label(egui::RichText::new(&self.status_text).size(12.0).color(col));
-                if let Some(pct) = self.progress_pct {
-                    ui.add(
-                        egui::ProgressBar::new((pct / 100.0).clamp(0.0, 1.0))
-                            .text(format!("{:.0}%", pct))
-                            .desired_width(180.0),
-                    );
-                }
-            });
-            ui.add_space(3.0);
-        });
-
-        if self.show_project_modal {
-            self.render_project_modal(ctx);
-        }
-
-        if self.is_playing {
-            let dt = ctx.input(|i| i.stable_dt as f64).min(0.1);
-            self.playhead_sec += dt;
-            let total = self.total_timeline_duration();
-            if self.playhead_sec >= total {
-                self.playhead_sec = 0.0;
-                self.stop_playback_process();
-            }
-            ctx.request_repaint();
-        }
-        if self.audio_is_playing && self.audio_duration_sec > 0.0 {
-            let dt = ctx.input(|i| i.stable_dt as f64).min(0.1);
-            self.audio_playhead_frac += (dt / self.audio_duration_sec) as f32;
-            if self.audio_playhead_frac >= 1.0 {
-                self.audio_playhead_frac = 0.0;
-                self.stop_playback_process();
-            }
-            ctx.request_repaint();
-        }
-
-        match self.mode {
-            AppMode::Audio => self.render_audio_mode(ctx),
-            AppMode::Video => self.render_video_mode(ctx),
-        }
-    }
-}
-
-impl GrainStudioApp {
-    fn render_project_modal(&mut self, ctx: &egui::Context) {
-        egui::Window::new("Project settings")
-            .collapsible(false)
-            .resizable(false)
-            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
             .show(ctx, |ui| {
-                ui.set_min_width(420.0);
-                ui.heading("Details");
-                ui.horizontal(|ui| {
-                    ui.label("Name:");
-                    ui.text_edit_singleline(&mut self.project.name);
-                });
-                egui::ComboBox::from_label("Color space")
-                    .selected_text(&self.project.color_space)
-                    .show_ui(ui, |ui| {
-                        for cs in ["Rec. 709 SDR", "sRGB", "Rec. 2020 HDR"] {
-                            ui.selectable_value(
-                                &mut self.project.color_space,
-                                cs.to_string(),
-                                cs,
-                            );
-                        }
-                    });
-                ui.separator();
-                ui.heading("Aspect ratio");
-                egui::ComboBox::from_label("Aspect ratio")
-                    .selected_text(self.project.aspect.label())
-                    .show_ui(ui, |ui| {
-                        for &ar in AspectRatioPreset::ALL {
-                            ui.selectable_value(&mut self.project.aspect, ar, ar.label());
-                        }
-                    });
-                egui::ComboBox::from_label("Framing")
-                    .selected_text(self.project.framing.label())
-                    .show_ui(ui, |ui| {
-                        ui.selectable_value(
-                            &mut self.project.framing,
-                            FramingMode::FitLetterbox,
-                            FramingMode::FitLetterbox.label(),
-                        );
-                        ui.selectable_value(
-                            &mut self.project.framing,
-                            FramingMode::FillCrop,
-                            FramingMode::FillCrop.label(),
-                        );
-                    });
-                ui.separator();
-                ui.heading("Timeline settings");
-                egui::ComboBox::from_label("Resolution")
-                    .selected_text(self.video_export.resolution.label())
-                    .show_ui(ui, |ui| {
-                        for &r in ResolutionPreset::ALL {
-                            ui.selectable_value(&mut self.video_export.resolution, r, r.label());
-                        }
-                    });
-                ui.add(egui::Slider::new(&mut self.video_export.fps, 24..=120).text("Frame rate"));
-                ui.add_space(10.0);
-                ui.horizontal(|ui| {
-                    if ui.button("Close / Save").clicked() {
-                        self.show_project_modal = false;
-                    }
-                });
-            });
-    }
-
-    fn render_audio_mode(&mut self, ctx: &egui::Context) {
-        egui::CentralPanel::default().show(ctx, |ui| {
-            egui::ScrollArea::vertical().show(ui, |ui| {
-                ui.vertical_centered(|ui| {
-                    ui.set_max_width(820.0);
-                    ui.add_space(12.0);
-                    ui.heading("Grain");
-                    ui.label("Upload audio, then shift pitch, stretch time, or add vibrato using a phase vocoder, WSOLA, Rubberband, or Bungee — each effect names its own trade-off.");
-                    ui.add_space(12.0);
-
-                    // Panel 1: Drop / File Picker + Audacity-style Stereo Track View
-                    egui::Frame::group(ui.style()).show(ui, |ui| {
-                        ui.set_min_width(780.0);
-                        ui.horizontal(|ui| {
-                            if ui.button("📂 Choose Audio / Video File...").clicked() {
-                                self.import_audio_file();
-                            }
-                            let a_play_lbl = if self.audio_is_playing { "❚❚ Pause" } else { "▶ Play" };
-                            if ui.button(a_play_lbl).clicked() {
-                                if self.audio_is_playing {
-                                    self.stop_playback_process();
-                                } else if let Some(p) = self.audiopath.clone() {
-                                    let start_t = self.audio_playhead_frac as f64 * self.audio_duration_sec;
-                                    self.start_ffplay_audio(&p, start_t);
-                                } else {
-                                    self.set_status("Load an audio file first to play.", true);
-                                }
-                            }
-                            if ui.button("⏹ Stop").clicked() {
-                                self.stop_playback_process();
-                                self.audio_playhead_frac = 0.0;
-                            }
-                            ui.label(egui::RichText::new(&self.audio_filename).strong());
-                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                ui.add(
-                                    egui::Slider::new(&mut self.audio_state.track_gain, 0.0..=1.5)
-                                        .text("Gain"),
-                                );
-                                let mute_lbl = if self.audio_state.track_muted {
-                                    "Unmute"
-                                } else {
-                                    "Mute"
-                                };
-                                if ui.button(mute_lbl).clicked() {
-                                    self.audio_state.track_muted = !self.audio_state.track_muted;
-                                }
-                            });
-                        });
-
-                        ui.add_space(8.0);
-                        let desired = egui::vec2(ui.available_width(), 190.0);
-                        let (rect, resp) = ui.allocate_exact_size(desired, egui::Sense::click());
-                        if resp.clicked() {
-                            if let Some(pos) = resp.interact_pointer_pos() {
-                                self.audio_playhead_frac =
-                                    ((pos.x - rect.left()) / rect.width()).clamp(0.0, 1.0);
-                            }
-                        }
-                        let painter = ui.painter();
-                        painter.rect_filled(rect, 4.0, egui::Color32::from_rgb(238, 241, 255));
-                        let ax_w = 42.0;
-                        let ax_rect =
-                            egui::Rect::from_min_max(rect.min, egui::pos2(rect.left() + ax_w, rect.max.y));
-                        painter.rect_filled(ax_rect, 0.0, egui::Color32::from_rgb(223, 227, 245));
-
-                        let band_h = rect.height() * 0.5;
-                        for (ch_idx, peaks) in [&self.audio_peaks_l, &self.audio_peaks_r]
-                            .iter()
-                            .enumerate()
-                        {
-                            let top = rect.top() + ch_idx as f32 * band_h;
-                            let mid = top + band_h * 0.5;
-                            let amp = band_h * 0.5 - 6.0;
-                            painter.line_segment(
-                                [egui::pos2(rect.left() + ax_w, mid), egui::pos2(rect.right(), mid)],
-                                egui::Stroke::new(1.0_f32, egui::Color32::from_rgb(198, 203, 230)),
-                            );
-                            if !peaks.is_empty() {
-                                let pw = rect.width() - ax_w;
-                                let step_x = pw / peaks.len() as f32;
-                                for (i, &(mn, mx)) in peaks.iter().enumerate() {
-                                    let x = rect.left() + ax_w + i as f32 * step_x;
-                                    let y_top = mid - mx * amp;
-                                    let y_bot = mid - mn * amp;
-                                    painter.line_segment(
-                                        [egui::pos2(x, y_top), egui::pos2(x, y_bot.max(y_top + 1.0))],
-                                        egui::Stroke::new(
-                                            step_x.max(1.2_f32),
-                                            egui::Color32::from_rgb(91, 95, 214),
-                                        ),
-                                    );
-                                }
-                            }
-                        }
-                        let ph_x = rect.left() + ax_w + (rect.width() - ax_w) * self.audio_playhead_frac;
-                        painter.line_segment(
-                            [egui::pos2(ph_x, rect.top()), egui::pos2(ph_x, rect.bottom())],
-                            egui::Stroke::new(1.5_f32, egui::Color32::from_rgb(251, 113, 133)),
-                        );
-                    });
-
-                    ui.add_space(10.0);
-
-                    // Panel 2: All 12 Effect Tabs + Parameters + Export Format
-                    egui::Frame::group(ui.style()).show(ui, |ui| {
-                        ui.set_min_width(780.0);
-                        ui.horizontal_wrapped(|ui| {
-                            for &tab in AudioTab::ALL {
-                                ui.selectable_value(
-                                    &mut self.audio_state.active_tab,
-                                    tab,
-                                    tab.label(),
-                                );
-                            }
-                        });
-                        ui.separator();
-
-                        match self.audio_state.active_tab {
-                            AudioTab::PitchShift => {
-                                ui.horizontal(|ui| {
-                                    if ui.button("🎛 Elastique Pro").clicked() {
-                                        self.audio_state.pitch_tech = StretchTech::ElastiquePro;
-                                    }
-                                    if ui.button("🥁 Elastique A17 Drums").clicked() {
-                                        self.audio_state.pitch_tech = StretchTech::ElastiqueA17;
-                                    }
-                                });
-                                egui::ComboBox::from_label("Technique")
-                                    .selected_text(self.audio_state.pitch_tech.label())
-                                    .show_ui(ui, |ui| {
-                                        for &t in StretchTech::ALL {
-                                            ui.selectable_value(
-                                                &mut self.audio_state.pitch_tech,
-                                                t,
-                                                t.label(),
-                                            );
-                                        }
-                                    });
-                                ui.add(
-                                    egui::Slider::new(
-                                        &mut self.audio_state.pitch_semitones,
-                                        -24.0..=24.0,
-                                    )
-                                    .text("Semitones"),
-                                );
-                                egui::ComboBox::from_label("FFT size (samples)")
-                                    .selected_text(format!("{}", self.audio_state.fft_size))
-                                    .show_ui(ui, |ui| {
-                                        for sz in [512usize, 1024, 2048, 4096, 8192] {
-                                            ui.selectable_value(
-                                                &mut self.audio_state.fft_size,
-                                                sz,
-                                                format!("{}", sz),
-                                            );
-                                        }
-                                    });
-                                ui.add(
-                                    egui::Slider::new(
-                                        &mut self.audio_state.formant_semitones,
-                                        -12.0..=12.0,
-                                    )
-                                    .text("Formant / timbre (semitones)"),
-                                );
-                                ui.checkbox(
-                                    &mut self.audio_state.formant_keep,
-                                    "Preserve original formants when shifting pitch",
-                                );
-                            }
-                            AudioTab::TimeStretch => {
-                                egui::ComboBox::from_label("Technique")
-                                    .selected_text(self.audio_state.time_tech.label())
-                                    .show_ui(ui, |ui| {
-                                        for &t in StretchTech::ALL {
-                                            ui.selectable_value(
-                                                &mut self.audio_state.time_tech,
-                                                t,
-                                                t.label(),
-                                            );
-                                        }
-                                    });
-                                ui.add(
-                                    egui::Slider::new(&mut self.audio_state.time_factor, 0.4..=2.5)
-                                        .text("Duration factor (pitch unchanged)"),
-                                );
-                            }
-                            AudioTab::Vibrato => {
-                                ui.horizontal(|ui| {
-                                    ui.selectable_value(
-                                        &mut self.audio_state.vibrato_pitch_only,
-                                        true,
-                                        "a — pitch only",
-                                    );
-                                    ui.selectable_value(
-                                        &mut self.audio_state.vibrato_pitch_only,
-                                        false,
-                                        "b — pitch + speed (native)",
-                                    );
-                                });
-                                if self.audio_state.vibrato_pitch_only {
-                                    egui::ComboBox::from_label("Technique")
-                                        .selected_text(self.audio_state.vibrato_tech.label())
-                                        .show_ui(ui, |ui| {
-                                            for &t in StretchTech::ALL {
-                                                ui.selectable_value(
-                                                    &mut self.audio_state.vibrato_tech,
-                                                    t,
-                                                    t.label(),
-                                                );
-                                            }
-                                        });
-                                }
-                                ui.add(
-                                    egui::Slider::new(&mut self.audio_state.vibrato_rate, 1.0..=12.0)
-                                        .text("Rate (Hz)"),
-                                );
-                                ui.add(
-                                    egui::Slider::new(
-                                        &mut self.audio_state.vibrato_depth,
-                                        0.1..=4.0,
-                                    )
-                                    .text("Depth (semitones)"),
-                                );
-                            }
-                            AudioTab::SpeedPitch => {
-                                ui.add(
-                                    egui::Slider::new(
-                                        &mut self.audio_state.speed_pitch_rate,
-                                        0.4..=2.5,
-                                    )
-                                    .text("Rate (x)"),
-                                );
-                            }
-                            AudioTab::Bitcrush => {
-                                ui.add(
-                                    egui::Slider::new(&mut self.audio_state.bit_depth, 1..=16)
-                                        .text("Bit depth"),
-                                );
-                                ui.add(
-                                    egui::Slider::new(&mut self.audio_state.sr_divisor, 1..=40)
-                                        .text("Sample-rate divisor"),
-                                );
-                            }
-                            AudioTab::Vocoder => {
-                                egui::ComboBox::from_label("Carrier waveform")
-                                    .selected_text(self.audio_state.vocoder_wave.label())
-                                    .show_ui(ui, |ui| {
-                                        for &w in CarrierWave::ALL {
-                                            ui.selectable_value(
-                                                &mut self.audio_state.vocoder_wave,
-                                                w,
-                                                w.label(),
-                                            );
-                                        }
-                                    });
-                                ui.add(
-                                    egui::Slider::new(
-                                        &mut self.audio_state.vocoder_freq,
-                                        40.0..=440.0,
-                                    )
-                                    .text("Carrier pitch (Hz)"),
-                                );
-                                ui.add(
-                                    egui::Slider::new(&mut self.audio_state.vocoder_bands, 4..=64)
-                                        .text("Bands"),
-                                );
-                            }
-                            AudioTab::Tremolo => {
-                                egui::ComboBox::from_label("Waveform")
-                                    .selected_text(self.audio_state.tremolo_wave.label())
-                                    .show_ui(ui, |ui| {
-                                        for &w in TremoloWave::ALL {
-                                            ui.selectable_value(
-                                                &mut self.audio_state.tremolo_wave,
-                                                w,
-                                                w.label(),
-                                            );
-                                        }
-                                    });
-                                ui.add(
-                                    egui::Slider::new(
-                                        &mut self.audio_state.tremolo_rate,
-                                        0.5..=20.0,
-                                    )
-                                    .text("Rate (Hz)"),
-                                );
-                                ui.add(
-                                    egui::Slider::new(
-                                        &mut self.audio_state.tremolo_depth,
-                                        0.0..=1.0,
-                                    )
-                                    .text("Depth"),
-                                );
-                            }
-                            AudioTab::Invert => {
-                                ui.label("Flips polarity sample-by-sample.");
-                            }
-                            AudioTab::MultiPitch => {
-                                egui::ComboBox::from_label("Technique")
-                                    .selected_text(self.audio_state.mp_tech.label())
-                                    .show_ui(ui, |ui| {
-                                        for &t in StretchTech::ALL {
-                                            ui.selectable_value(
-                                                &mut self.audio_state.mp_tech,
-                                                t,
-                                                t.label(),
-                                            );
-                                        }
-                                    });
-                                let labels = ["-12", "-7", "-5", "-3", "0", "+3", "+5", "+7", "+12"];
-                                ui.horizontal_wrapped(|ui| {
-                                    for (i, lbl) in labels.iter().enumerate() {
-                                        ui.checkbox(&mut self.audio_state.mp_intervals[i], *lbl);
-                                    }
-                                });
-                            }
-                            AudioTab::MoreFx => {
-                                egui::ComboBox::from_label("Effect")
-                                    .selected_text(self.audio_state.more_type.label())
-                                    .show_ui(ui, |ui| {
-                                        for &m in MoreFxType::ALL {
-                                            ui.selectable_value(
-                                                &mut self.audio_state.more_type,
-                                                m,
-                                                m.label(),
-                                            );
-                                        }
-                                    });
-                                match self.audio_state.more_type {
-                                    MoreFxType::Reverse => {}
-                                    MoreFxType::Echo => {
-                                        ui.add(
-                                            egui::Slider::new(
-                                                &mut self.audio_state.echo_delay_ms,
-                                                10.0..=800.0,
-                                            )
-                                            .text("Delay (ms)"),
-                                        );
-                                        ui.add(
-                                            egui::Slider::new(
-                                                &mut self.audio_state.echo_feedback,
-                                                0.0..=0.95,
-                                            )
-                                            .text("Feedback"),
-                                        );
-                                    }
-                                    MoreFxType::Distortion => {
-                                        ui.add(
-                                            egui::Slider::new(
-                                                &mut self.audio_state.dist_drive,
-                                                1.0..=20.0,
-                                            )
-                                            .text("Drive"),
-                                        );
-                                    }
-                                }
-                            }
-                            AudioTab::StudioFx => {
-                                egui::ComboBox::from_label("Studio Effect (40 DSP processors)")
-                                    .selected_text(self.audio_state.studio_type.label())
-                                    .show_ui(ui, |ui| {
-                                        for &sfx in StudioFxType::ALL {
-                                            ui.selectable_value(
-                                                &mut self.audio_state.studio_type,
-                                                sfx,
-                                                sfx.label(),
-                                            );
-                                        }
-                                    });
-                                ui.add(
-                                    egui::Slider::new(&mut self.audio_state.sf_rate, 0.1..=10.0)
-                                        .text("Rate (Hz)"),
-                                );
-                                ui.add(
-                                    egui::Slider::new(&mut self.audio_state.sf_depth, 0.0..=1.0)
-                                        .text("Depth"),
-                                );
-                                ui.add(
-                                    egui::Slider::new(&mut self.audio_state.sf_mix, 0.0..=1.0)
-                                        .text("Mix"),
-                                );
-                                ui.add(
-                                    egui::Slider::new(&mut self.audio_state.sf_decay, 0.3..=6.0)
-                                        .text("Reverb Decay (s)"),
-                                );
-                                ui.add(
-                                    egui::Slider::new(&mut self.audio_state.sf_fc, 50.0..=12000.0)
-                                        .text("Filter / Carrier Freq (Hz)"),
-                                );
-                                ui.add(
-                                    egui::Slider::new(
-                                        &mut self.audio_state.sf_gain_db,
-                                        -24.0..=24.0,
-                                    )
-                                    .text("Gain / Bass Boost (dB)"),
-                                );
-                                ui.add(
-                                    egui::Slider::new(
-                                        &mut self.audio_state.sf_fade_in,
-                                        0.0..=10.0,
-                                    )
-                                    .text("Fade In (s)"),
-                                );
-                                ui.add(
-                                    egui::Slider::new(
-                                        &mut self.audio_state.sf_fade_out,
-                                        0.0..=10.0,
-                                    )
-                                    .text("Fade Out (s)"),
-                                );
-                                ui.collapsing("Advanced Studio Parameters (EQ / Drive / Gate / Pan / Sub)", |ui| {
-                                    ui.add(egui::Slider::new(&mut self.audio_state.sf_p1, -12.0..=30.0).text("Param 1 (Low EQ / Drive / Pan / Threshold)"));
-                                    ui.add(egui::Slider::new(&mut self.audio_state.sf_p2, -12.0..=12.0).text("Param 2 (Mid EQ / Feedback / Release)"));
-                                    ui.add(egui::Slider::new(&mut self.audio_state.sf_p3, 50.0..=12000.0).text("Param 3 (Freq Hz / Delay ms)"));
-                                    ui.add(egui::Slider::new(&mut self.audio_state.sf_p4, -12.0..=12.0).text("Param 4 (High EQ / Mix / Depth)"));
-                                });
-                            }
-                            AudioTab::Rubberband => {
-                                ui.add(
-                                    egui::Slider::new(&mut self.audio_state.rb_semis, -24.0..=24.0)
-                                        .text("Pitch (semitones)"),
-                                );
-                                ui.add(
-                                    egui::Slider::new(&mut self.audio_state.rb_tempo, 0.25..=4.0)
-                                        .text("Tempo (speed)"),
-                                );
-                                ui.horizontal(|ui| {
-                                    ui.label("Formant v4 (0..2,147,483,647; 0=auto):");
-                                    ui.add(
-                                        egui::DragValue::new(&mut self.audio_state.rb_formant_v4)
-                                            .range(0..=2_147_483_647u32),
-                                    );
-                                });
-                                egui::ComboBox::from_label("Formant (FFmpeg af_rubberband)")
-                                    .selected_text(&self.audio_state.rb_formant)
-                                    .show_ui(ui, |ui| {
-                                        for v in ["unset", "preserved", "shifted"] {
-                                            ui.selectable_value(
-                                                &mut self.audio_state.rb_formant,
-                                                v.into(),
-                                                v,
-                                            );
-                                        }
-                                    });
-                                egui::ComboBox::from_label("Transients")
-                                    .selected_text(&self.audio_state.rb_transients)
-                                    .show_ui(ui, |ui| {
-                                        for v in ["crisp", "mixed", "smooth"] {
-                                            ui.selectable_value(
-                                                &mut self.audio_state.rb_transients,
-                                                v.into(),
-                                                v,
-                                            );
-                                        }
-                                    });
-                                ui.label("FFmpeg CLI Command:");
-                                let mut cli = self.audio_state.rb_ffmpeg_cli();
-                                ui.add(
-                                    egui::TextEdit::multiline(&mut cli)
-                                        .desired_rows(2)
-                                        .desired_width(f32::INFINITY),
-                                );
-                            }
-                        }
-
-                        ui.add_space(8.0);
-                        ui.label(
-                            egui::RichText::new(self.audio_state.active_tab.description())
-                                .small()
-                                .color(egui::Color32::GRAY),
-                        );
-                        ui.separator();
-
-                        ui.horizontal(|ui| {
-                            egui::ComboBox::from_label("Format")
-                                .selected_text(self.audio_state.export_format.label())
-                                .show_ui(ui, |ui| {
-                                    for &fmt in AudioExportFormat::ALL {
-                                        ui.selectable_value(
-                                            &mut self.audio_state.export_format,
-                                            fmt,
-                                            fmt.label(),
-                                        );
-                                    }
-                                });
-                            egui::ComboBox::from_label("Sample Rate")
-                                .selected_text(format!("{} kHz", self.audio_state.export_sample_rate / 1000))
-                                .show_ui(ui, |ui| {
-                                    for sr in [44_100u32, 48_000, 96_000, 192_000] {
-                                        ui.selectable_value(
-                                            &mut self.audio_state.export_sample_rate,
-                                            sr,
-                                            format!("{} kHz", sr / 1000),
-                                        );
-                                    }
-                                });
-                            egui::ComboBox::from_label("Bitrate")
-                                .selected_text(format!("{} kbps", self.audio_state.export_bitrate_kbps))
-                                .show_ui(ui, |ui| {
-                                    for br in [128u32, 192, 256, 320, 512] {
-                                        ui.selectable_value(
-                                            &mut self.audio_state.export_bitrate_kbps,
-                                            br,
-                                            format!("{} kbps", br),
-                                        );
-                                    }
-                                });
-                        });
-
-                        ui.add_space(10.0);
-                        let run_btn = egui::Button::new(
-                            egui::RichText::new("Process & Export Audio")
-                                .strong()
-                                .color(egui::Color32::from_rgb(6, 32, 29)),
-                        )
-                        .fill(egui::Color32::from_rgb(45, 212, 191))
-                        .min_size(egui::vec2(ui.available_width(), 38.0));
-
-                        if ui.add(run_btn).clicked() {
-                            self.run_audio_process();
-                        }
-                    });
-                });
-            });
-        });
-    }
-
-    fn render_video_mode(&mut self, ctx: &egui::Context) {
-        // 1. Left Library Panel
-        egui::SidePanel::left("cap_lib_panel")
-            .min_width(360.0)
-            .default_width(385.0)
-            .show(ctx, |ui| {
-                ui.add_space(4.0);
-                ui.horizontal_wrapped(|ui| {
-                    for &page in LibraryPage::ALL {
-                        ui.selectable_value(&mut self.lib_page, page, page.label());
-                    }
-                });
-                ui.separator();
-
-                egui::ScrollArea::vertical().show(ui, |ui| match self.lib_page {
-                    LibraryPage::Media => self.render_lib_media(ui),
-                    LibraryPage::Effects => self.render_lib_effects(ui),
-                    LibraryPage::Transitions => self.render_lib_transitions(ui),
-                    LibraryPage::Text => self.render_lib_text(ui),
-                    LibraryPage::Adjust => self.render_lib_adjust(ui),
-                    LibraryPage::OpenFx => self.render_lib_openfx(ui),
-                    LibraryPage::Export => self.render_lib_export(ui),
-                });
-            });
-
-        // 2. Right Details & Keyframe Easing Curve Editor Panel
-        egui::SidePanel::right("cap_details_panel")
-            .min_width(300.0)
-            .default_width(320.0)
-            .show(ctx, |ui| {
-                ui.add_space(4.0);
-                ui.horizontal(|ui| {
-                    ui.label(
-                        egui::RichText::new("Details")
-                            .strong()
-                            .color(egui::Color32::from_rgb(60, 207, 224)),
-                    );
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if ui.button("Project settings").clicked() {
-                            self.show_project_modal = true;
-                        }
-                    });
-                });
-                ui.separator();
-
-                egui::ScrollArea::vertical().show(ui, |ui| {
-                    let dur_str = if let Some(idx) = self.selected_clip_idx {
-                        self.clips
-                            .get(idx)
-                            .map(|c| format!("{:.2} s", c.effective_duration()))
-                            .unwrap_or_else(|| "—".into())
-                    } else {
-                        "—".into()
-                    };
-                    egui::Grid::new("details_grid").num_columns(2).show(ui, |ui| {
-                        ui.label("Name:");
-                        ui.label(&self.project.name);
-                        ui.end_row();
-                        ui.label("Source size:");
-                        ui.label(format!("{}×{}", self.source_res.0, self.source_res.1));
-                        ui.end_row();
-                        ui.label("Duration:");
-                        ui.label(dur_str);
-                        ui.end_row();
-                        ui.label("Export size:");
-                        ui.label(self.video_export.resolution.label());
-                        ui.end_row();
-                        ui.label("Export frame rate:");
-                        ui.label(format!("{} fps", self.video_export.fps));
-                        ui.end_row();
-                        ui.label("Active OpenFX:");
-                        ui.label(format!("{} loaded", self.active_ofx_identifiers.len()));
-                        ui.end_row();
-                    });
-
-                    ui.separator();
-                    ui.label("Keyframe easing (from this key to the next)");
-                    egui::ComboBox::from_id_salt("kfeasing_box")
-                        .selected_text(self.selectedeasing.label())
-                        .show_ui(ui, |ui| {
-                            for &ec in EasingCurve::ALL {
-                                ui.selectable_value(&mut self.selectedeasing, ec, ec.label());
-                            }
-                        });
-
-                    ui.add_space(6.0);
-                    ui.label("Curve editor preview:");
-                    let (curve_rect, _) =
-                        ui.allocate_exact_size(egui::vec2(180.0, 180.0), egui::Sense::hover());
-                    let p = ui.painter();
-                    p.rect_filled(curve_rect, 4.0, egui::Color32::from_rgb(21, 22, 26));
-                    p.rect_stroke(
-                        curve_rect,
-                        4.0,
-                        egui::Stroke::new(1.0_f32, egui::Color32::from_rgb(55, 60, 72)),
-                    );
-                    let mut pts = Vec::with_capacity(51);
-                    for i in 0..=50 {
-                        let t = i as f32 / 50.0;
-                        let y_val = self.selectedeasing.eval(t);
-                        let px = curve_rect.left() + 12.0 + t * (curve_rect.width() - 24.0);
-                        let py = curve_rect.bottom() - 24.0 - y_val * (curve_rect.height() - 48.0);
-                        pts.push(egui::pos2(px, py));
-                    }
-                    p.add(egui::Shape::line(
-                        pts,
-                        egui::Stroke::new(2.5_f32, egui::Color32::from_rgb(34, 199, 184)),
-                    ));
-
-                    ui.add_space(8.0);
-                    ui.horizontal(|ui| {
-                        if ui.button("◆ Add keyframe").clicked() {
-                            if let Some(idx) = self.selected_clip_idx {
-                                if let Some(c) = self.clips.get(idx) {
-                                    self.keyframes.push(VideoKeyframe {
-                                        time_sec: self.playhead_sec,
-                                        easing: self.selectedeasing,
-                                        brightness: c.fx.brightness,
-                                        contrast: c.fx.contrast,
-                                        saturation: c.fx.saturation,
-                                        hue: c.fx.hue_deg,
-                                        blur: c.fx.blur_px,
-                                        zoom: c.fx.zoom_pct,
-                                        rotate: c.fx.rotate_deg,
-                                    });
-                                    self.set_status(
-                                        format!(
-                                            "Added keyframe @ {:.2}s ({})",
-                                            self.playhead_sec,
-                                            self.selectedeasing.label()
-                                        ),
-                                        false,
-                                    );
-                                }
-                            }
-                        }
-                        if ui.button("Clear keyframes").clicked() {
-                            self.keyframes.clear();
-        self.effect_keyframes.clear();
-                            self.set_status("Cleared all keyframes.", false);
-                        }
-                    });
-                    if !self.keyframes.is_empty() {
-                        let _active_fx = if !self.effect_keyframes.is_empty() {
-                        evaluate_keyframed_params(&self.effect_keyframes, self.playhead_sec)
-                    } else if let Some(idx) = self.selected_clip_idx {
-                        self.clips.get(idx).map(|c| c.fx.clone()).unwrap_or_default()
-                    } else {
-                        VideoFxParams::default()
-                    };
-                    ui.label(format!("Active keyframes: {} • Glow: {:.0}% • Blur: {:.1}px", self.effect_keyframes.len(), _active_fx.glow.max(_active_fx.s_glow), _active_fx.blur_px));
-                    }
-                });
-            });
-
-        // 3. Bottom Vegas Pro 15-Style Multi-Track Timeline Panel
-        egui::TopBottomPanel::bottom("vegas_timeline_panel")
-            .min_height(250.0)
-            .show(ctx, |ui| {
-                ui.add_space(4.0);
-                ui.horizontal_wrapped(|ui| {
-                    if ui.button("+ Add video clip").clicked() {
-                        self.import_video_clip();
-                    }
-                    if ui.button("✂ Split").clicked() {
-                        self.split_selected_at_playhead();
-                    }
-                    if ui.button("✕ Delete").clicked() {
-                        if let Some(idx) = self.selected_clip_idx {
-                            if idx < self.clips.len() {
-                                self.push_undo();
-                                self.clips.remove(idx);
-                                self.selected_clip_idx = if self.clips.is_empty() {
-                                    None
-                                } else {
-                                    Some(idx.min(self.clips.len() - 1))
-                                };
-                            }
-                        }
-                    }
-                    if ui.button("◀").clicked() {
-                        if let Some(idx) = self.selected_clip_idx {
-                            if idx > 0 {
-                                self.push_undo();
-                                self.clips.swap(idx, idx - 1);
-                                self.selected_clip_idx = Some(idx - 1);
-                            }
-                        }
-                    }
-                    if ui.button("▶").clicked() {
-                        if let Some(idx) = self.selected_clip_idx {
-                            if idx + 1 < self.clips.len() {
-                                self.push_undo();
-                                self.clips.swap(idx, idx + 1);
-                                self.selected_clip_idx = Some(idx + 1);
-                            }
-                        }
-                    }
-                    if ui.button("+ Overlay").clicked() {
-                        self.import_overlay_clip();
-                    }
-                    if ui.button("+ Audio clip").clicked() {
-                        self.import_music_clip();
-                    }
-                    if ui.button("+ Text").clicked() {
-                        self.push_undo();
-                        self.text_overlays.push(self.draft_text.clone());
-                    }
-                    if ui.button("Undo").clicked() {
-                        self.undo();
-                    }
-                    if ui.button("Redo").clicked() {
-                        self.redo();
-                    }
-                    if ui.button("Duplicate").clicked() {
-                        self.duplicate_selected_clip();
-                    }
-                    let snap_lbl = if self.snapenabled {
-                        "Snap: on"
-                    } else {
-                        "Snap: off"
-                    };
-                    if ui.button(snap_lbl).clicked() {
-                        self.snapenabled = !self.snapenabled;
-                    }
-                    ui.add(egui::Slider::new(&mut self.tl_zoom, 15.0..=180.0).text("Zoom"));
-                    let exp_seq = egui::Button::new(
-                        egui::RichText::new("▶ Export sequence")
-                            .strong()
-                            .color(egui::Color32::BLACK),
-                    )
-                    .fill(egui::Color32::from_rgb(60, 207, 224));
-                    if ui.add(exp_seq).clicked() {
-                        self.trigger_video_export();
-                    }
-                });
-                ui.separator();
-
-                let total_dur = self.total_timeline_duration();
-                egui::ScrollArea::horizontal().show(ui, |ui| {
-                    let row_h = 34.0;
-                    let header_w = 135.0;
-                    let canvas_w = (header_w + total_dur as f32 * self.tl_zoom + 120.0)
-                        .max(ui.available_width());
-                    let canvas_h = 22.0 + row_h * 5.0;
-                    let (rect, resp) =
-                        ui.allocate_exact_size(egui::vec2(canvas_w, canvas_h), egui::Sense::click());
-
-                    if resp.clicked() {
-                        if let Some(pos) = resp.interact_pointer_pos() {
-                            if pos.x > rect.left() + header_w {
-                                self.playhead_sec = ((pos.x - (rect.left() + header_w)) / self.tl_zoom)
-                                    .max(0.0) as f64;
-                            }
-                        }
-                    }
-
-                    let p = ui.painter();
-                    p.rect_filled(rect, 2.0, egui::Color32::from_rgb(43, 43, 43));
-
-                    let lanes = [
-                        ("T1", "Text 1", egui::Color32::from_rgb(226, 182, 74)),
-                        ("V2", "Overlay 2", egui::Color32::from_rgb(91, 143, 224)),
-                        ("V1", "Video 1", egui::Color32::from_rgb(63, 182, 187)),
-                        ("A1", "Audio 1", egui::Color32::from_rgb(143, 116, 217)),
-                        ("A2", "Music 2", egui::Color32::from_rgb(154, 132, 217)),
-                    ];
-
-                    for (idx, (badge, name, col)) in lanes.iter().enumerate() {
-                        let y0 = rect.top() + 22.0 + idx as f32 * row_h;
-                        let hdr_rect = egui::Rect::from_min_size(
-                            egui::pos2(rect.left(), y0),
-                            egui::vec2(header_w, row_h),
-                        );
-                        p.rect_filled(hdr_rect, 0.0, egui::Color32::from_rgb(58, 58, 58));
-                        let badge_rect = egui::Rect::from_min_size(
-                            egui::pos2(rect.left() + 8.0, y0 + 8.0),
-                            egui::vec2(22.0, 18.0),
-                        );
-                        p.rect_filled(badge_rect, 2.0, *col);
-                        p.text(
-                            badge_rect.center(),
-                            egui::Align2::CENTER_CENTER,
-                            *badge,
-                            egui::FontId::proportional(10.0),
-                            egui::Color32::BLACK,
-                        );
-                        p.text(
-                            egui::pos2(rect.left() + 36.0, y0 + row_h * 0.5),
-                            egui::Align2::LEFT_CENTER,
-                            *name,
-                            egui::FontId::proportional(11.0),
-                            egui::Color32::from_rgb(230, 230, 230),
-                        );
-                    }
-
-                    let mut x_cursor = rect.left() + header_w;
-                    let y_v1 = rect.top() + 22.0 + 2.0 * row_h + 3.0;
-                    let y_a1 = rect.top() + 22.0 + 3.0 * row_h + 3.0;
-                    for (i, clip) in self.clips.iter().enumerate() {
-                        let w = (clip.effective_duration() as f32 * self.tl_zoom).max(24.0);
-                        let v_rect = egui::Rect::from_min_size(
-                            egui::pos2(x_cursor, y_v1),
-                            egui::vec2(w, row_h - 6.0),
-                        );
-                        let a_rect = egui::Rect::from_min_size(
-                            egui::pos2(x_cursor, y_a1),
-                            egui::vec2(w, row_h - 6.0),
-                        );
-                        let is_sel = self.selected_clip_idx == Some(i);
-                        p.rect_filled(
-                            v_rect,
-                            3.0,
-                            if is_sel {
-                                egui::Color32::from_rgb(113, 210, 213)
-                            } else {
-                                egui::Color32::from_rgb(58, 167, 173)
-                            },
-                        );
-                        if is_sel {
-                            p.rect_stroke(
-                                v_rect,
-                                3.0,
-                                egui::Stroke::new(1.5_f32, egui::Color32::WHITE),
-                            );
-                        }
-                        p.text(
-                            egui::pos2(v_rect.left() + 6.0, v_rect.center().y),
-                            egui::Align2::LEFT_CENTER,
-                            &clip.name,
-                            egui::FontId::proportional(10.5),
-                            egui::Color32::BLACK,
-                        );
-                        p.rect_filled(a_rect, 3.0, egui::Color32::from_rgb(110, 88, 175));
-                        x_cursor += w + 2.0;
-                    }
-
-                    let y_t1 = rect.top() + 22.0 + 3.0;
-                    for tx in &self.text_overlays {
-                        let x0 = rect.left() + header_w + tx.start_sec as f32 * self.tl_zoom;
-                        let dur = if tx.end_sec > tx.start_sec {
-                            (tx.end_sec - tx.start_sec) as f32
-                        } else {
-                            3.0
-                        };
-                        let r = egui::Rect::from_min_size(
-                            egui::pos2(x0, y_t1),
-                            egui::vec2((dur * self.tl_zoom).max(30.0), row_h - 6.0),
-                        );
-                        p.rect_filled(r, 3.0, egui::Color32::from_rgb(242, 210, 122));
-                        p.text(
-                            egui::pos2(r.left() + 5.0, r.center().y),
-                            egui::Align2::LEFT_CENTER,
-                            &tx.text,
-                            egui::FontId::proportional(10.0),
-                            egui::Color32::BLACK,
-                        );
-                    }
-
-                    let ph_x = rect.left() + header_w + self.playhead_sec as f32 * self.tl_zoom;
-                    p.line_segment(
-                        [egui::pos2(ph_x, rect.top()), egui::pos2(ph_x, rect.bottom())],
-                        egui::Stroke::new(1.5_f32, egui::Color32::from_rgb(255, 93, 82)),
-                    );
-                });
-            });
-
-        // 4. Center Preview Monitor & Transport
-        egui::CentralPanel::default().show(ctx, |ui| {
-            ui.vertical_centered(|ui| {
-                ui.add_space(6.0);
-                ui.label(
-                    egui::RichText::new(format!("Preview · {}", self.project.name))
-                        .strong()
-                        .color(egui::Color32::from_rgb(232, 232, 232)),
-                );
-                ui.add_space(8.0);
-
-                let avail = ui.available_size();
-                let mon_w = (avail.x - 32.0).clamp(320.0, 780.0);
-                let mon_h = (avail.y - 68.0).clamp(180.0, 440.0);
-                let (mon_rect, _) =
-                    ui.allocate_exact_size(egui::vec2(mon_w, mon_h), egui::Sense::hover());
-                self.update_video_preview_texture(ctx);
                 let p = ui.painter();
-                p.rect_filled(mon_rect, 3.0, egui::Color32::BLACK);
-                if let Some(tex) = &self.preview_texture {
-                    p.image(
-                        tex.id(),
-                        mon_rect,
-                        egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
-                        egui::Color32::WHITE,
-                    );
-                }
-                p.rect_stroke(
-                    mon_rect,
-                    3.0,
-                    egui::Stroke::new(1.0_f32, egui::Color32::from_rgb(38, 42, 52)),
-                );
-
-                let _active_fx = if !self.effect_keyframes.is_empty() {
-                    evaluate_keyframed_params(&self.effect_keyframes, self.playhead_sec)
-                } else if let Some(idx) = self.selected_clip_idx {
-                    self.clips.get(idx).map(|c| c.fx.clone()).unwrap_or_default()
+                // background image (or flat fallback), then a dark scrim
+                if let Some(bg) = &self.splash_bg_tex {
+                    p.image(bg.id(), screen, uv, Color32::WHITE);
                 } else {
-                    VideoFxParams::default()
-                };
-                if let Some(idx) = self.selected_clip_idx {
-                    if let Some(c) = self.clips.get(idx) {
-                        p.text(
-                            egui::pos2(mon_rect.center().x, mon_rect.center().y - 16.0),
-                            egui::Align2::CENTER_CENTER,
-                            format!("{} ({:.2}s @ {:.2}x)", c.name, c.effective_duration(), c.speed),
-                            egui::FontId::proportional(14.0),
-                            egui::Color32::from_rgb(60, 207, 224),
-                        );
-                        p.text(
-                            egui::pos2(mon_rect.center().x, mon_rect.center().y + 10.0),
-                            egui::Align2::CENTER_CENTER,
-                            format!(
-                                "Aspect: {} ({}) • Color: {} • Effect KFs: {} • Glow: {:.0}% • Blur: {:.1}px",
-                                self.project.aspect.label(),
-                                self.project.framing.label(),
-                                self.project.color_space,
-                                self.effect_keyframes.len(), _active_fx.glow.max(_active_fx.s_glow), _active_fx.blur_px
-                            ),
-                            egui::FontId::proportional(11.5),
-                            egui::Color32::GRAY,
-                        );
-                    }
-                } else {
-                    p.text(
-                        mon_rect.center(),
-                        egui::Align2::CENTER_CENTER,
-                        "Drop or import a video file in Media to begin",
-                        egui::FontId::proportional(13.0),
-                        egui::Color32::GRAY,
-                    );
+                    p.rect_filled(screen, 0.0, Color32::from_rgb(10, 12, 18));
                 }
-
-                for tx in &self.text_overlays {
-                    let active = self.playhead_sec >= tx.start_sec
-                        && (tx.end_sec <= 0.0 || self.playhead_sec <= tx.end_sec);
-                    if active && !tx.text.is_empty() {
-                        let px = mon_rect.left() + mon_rect.width() * (tx.x_pct / 100.0);
-                        let py = mon_rect.top() + mon_rect.height() * (tx.y_pct / 100.0);
-                        p.text(
-                            egui::pos2(px, py),
-                            egui::Align2::CENTER_CENTER,
-                            &tx.text,
-                            egui::FontId::proportional((tx.size_pct / 100.0 * mon_rect.height()).max(12.0)),
-                            egui::Color32::from_rgb(tx.color[0], tx.color[1], tx.color[2]),
-                        );
-                    }
-                }
-
-                ui.add_space(8.0);
-                let total = self.total_timeline_duration();
-                ui.horizontal(|ui| {
-                    ui.add_space((ui.available_width() - 340.0).max(0.0) * 0.5);
-                    if ui.button("|<").clicked() {
-                        self.playhead_sec = 0.0;
-                    }
-                    if ui.button("<").clicked() {
-                        self.playhead_sec = (self.playhead_sec - 1.0 / 30.0).max(0.0);
-                    }
-                    let play_txt = if self.is_playing {
-                        "❚❚ Pause"
-                    } else {
-                        "▶ Play"
-                    };
-                    let play_btn = egui::Button::new(
-                        egui::RichText::new(play_txt)
-                            .strong()
-                            .color(egui::Color32::from_rgb(6, 32, 29)),
-                    )
-                    .fill(egui::Color32::from_rgb(45, 212, 191));
-                    if ui.add(play_btn).clicked() {
-                        if self.is_playing {
-                            self.stop_playback_process();
-                        } else {
-                            self.is_playing = true;
-                            if let Some(idx) = self.selected_clip_idx {
-                                if let Some(c) = self.clips.get(idx).cloned() {
-                                    self.start_ffplay_video_audio(&c.path, c.trim_start_sec + self.playhead_sec);
-                                }
-                            }
-                        }
-                    }
-                    if ui.button("⏹ Stop").clicked() {
-                        self.stop_playback_process();
-                        self.playhead_sec = 0.0;
-                    }
-                    if ui.button(">").clicked() {
-                        self.playhead_sec = (self.playhead_sec + 1.0 / 30.0).min(total);
-                    }
-                    if ui.button(">|").clicked() {
-                        self.playhead_sec = total;
-                    }
-                    ui.label(format!(
-                        "{} / {}",
-                        format_timecode(self.playhead_sec),
-                        format_timecode(total)
-                    ));
-                });
-            });
-        });
-    }
-
-    fn render_lib_media(&mut self, ui: &mut egui::Ui) {
-        if ui.button("📂 Import Video Clip...").clicked() {
-            self.import_video_clip();
-        }
-        if let Some(idx) = self.selected_clip_idx {
-            if let Some(c) = self.clips.get_mut(idx) {
-                ui.add_space(6.0);
-                ui.label(egui::RichText::new(&c.name).strong());
-                ui.add(
-                    egui::Slider::new(
-                        &mut c.trim_start_sec,
-                        0.0..=(c.trim_end_sec - 0.1).max(0.0),
-                    )
-                    .text("Trim In (s)"),
+                p.rect_filled(
+                    screen,
+                    0.0,
+                    Color32::from_rgba_unmultiplied(0, 0, 0, 110),
                 );
-                ui.add(
-                    egui::Slider::new(
-                        &mut c.trim_end_sec,
-                        (c.trim_start_sec + 0.1)..=c.duration_sec,
-                    )
-                    .text("Trim Out (s)"),
-                );
-                ui.add(egui::Slider::new(&mut c.speed, 0.25..=3.0).text("Speed (x)"));
-            }
-        }
-        ui.separator();
-        ui.heading("Tracks (V2 Overlay & A2 Music)");
-        if ui.button("+ Import Overlay Video (V2)...").clicked() {
-            self.import_overlay_clip();
-        }
-        if let Some(ov) = self.overlays.last_mut() {
-            ui.add(egui::Slider::new(&mut ov.x_pct, 0.0..=100.0).text("Overlay X %"));
-            ui.add(egui::Slider::new(&mut ov.y_pct, 0.0..=100.0).text("Overlay Y %"));
-            ui.add(egui::Slider::new(&mut ov.size_pct, 5.0..=100.0).text("Overlay Size %"));
-            ui.add(egui::Slider::new(&mut ov.opacity_pct, 0.0..=100.0).text("Overlay Opacity %"));
-        }
-        ui.add_space(6.0);
-        if ui.button("+ Import Music Track (A2)...").clicked() {
-            self.import_music_clip();
-        }
-        if let Some(mu) = self.music_tracks.last_mut() {
-            ui.add(egui::Slider::new(&mut mu.volume_pct, 0.0..=100.0).text("Music Volume %"));
-        }
-    }
 
-    fn render_lib_effects(&mut self, ui: &mut egui::Ui) {
-        ui.horizontal(|ui| {
-            ui.label("Search:");
-            ui.text_edit_singleline(&mut self.effect_search);
-        });
-        ui.horizontal(|ui| {
-            if ui.button("Reset to none").clicked() {
-                self.reset_effects_to_none();
-            }
-            if ui.button("◆ Keyframe Effect").clicked() {
-                let _active_fx = if !self.effect_keyframes.is_empty() {
-                    evaluate_keyframed_params(&self.effect_keyframes, self.playhead_sec)
-                } else if let Some(idx) = self.selected_clip_idx {
-                    self.clips.get(idx).map(|c| c.fx.clone()).unwrap_or_default()
-                } else {
-                    VideoFxParams::default()
-                };
-                if let Some(idx) = self.selected_clip_idx {
-                    if let Some(c) = self.clips.get(idx) {
-                        self.effect_keyframes.push(EffectKeyframe {
-                            time_sec: self.playhead_sec,
-                            easing: self.selectedeasing,
-                            params: c.fx.clone(),
-                        });
-                        self.effect_keyframes.sort_by(|a, b| a.time_sec.partial_cmp(&b.time_sec).unwrap_or(std::cmp::Ordering::Equal));
-                        let dyn_ff = build_dynamic_ffmpeg_filter(&self.effect_keyframes, &c.fx);
-                        self.set_status(
-                            format!("Keyframed effect @ {:.2}s ({}) | FFmpeg+++: {}", self.playhead_sec, self.selectedeasing.label(), dyn_ff),
-                            false,
-                        );
-                    }
-                }
-            }
-        });
-        ui.add_space(4.0);
+                let cx = screen.center().x;
+                let cy = screen.center().y;
 
-        let Some(idx) = self.selected_clip_idx else {
-            ui.label("Import or select a clip on V1 to configure effects.");
-            return;
-        };
-        let fx = &mut self.clips[idx].fx;
-        let q = self.effect_search.trim().to_lowercase();
-        let show = |name: &str| q.is_empty() || name.to_lowercase().contains(&q);
-
-        if show("effects blur vignette grain scanlines pixelate glitch posterize rgb split kaleidoscope shake trail") {
-            ui.collapsing("Effects", |ui| {
-                ui.add(egui::Slider::new(&mut fx.blur_px, 0.0..=12.0).text("Blur (px)"));
-                ui.add(egui::Slider::new(&mut fx.vignette, 0.0..=1.0).text("Vignette"));
-                ui.add(egui::Slider::new(&mut fx.film_grain, 0.0..=1.0).text("Film grain"));
-                ui.add(egui::Slider::new(&mut fx.scanlines, 0.0..=1.0).text("Scanlines"));
-                ui.add(egui::Slider::new(&mut fx.pixelate, 0.0..=60.0).text("Pixelate (px)"));
-                ui.add(egui::Slider::new(&mut fx.glitch, 0.0..=1.0).text("Glitch"));
-                ui.add(egui::Slider::new(&mut fx.posterize, 0.0..=1.0).text("Posterize"));
-                ui.add(egui::Slider::new(&mut fx.rgb_split, 0.0..=40.0).text("RGB split (px)"));
-                ui.add(egui::Slider::new(&mut fx.kaleidoscope, 0..=12).text("Kaleidoscope segments"));
-                ui.add(egui::Slider::new(&mut fx.camera_shake, 0.0..=40.0).text("Camera shake"));
-                ui.add(egui::Slider::new(&mut fx.motion_trail, 0.0..=0.9).text("Motion trail"));
-            });
-        }
-
-        if show("mask ellipse rectangle linear gradient feather invert") {
-            ui.collapsing("Mask", |ui| {
-                egui::ComboBox::from_label("Mask type")
-                    .selected_text(fx.mask_type.label())
-                    .show_ui(ui, |ui| {
-                        for &mt in MaskType::ALL {
-                            ui.selectable_value(&mut fx.mask_type, mt, mt.label());
-                        }
-                    });
-                ui.add(egui::Slider::new(&mut fx.mask_x, 0.0..=100.0).text("Center X %"));
-                ui.add(egui::Slider::new(&mut fx.mask_y, 0.0..=100.0).text("Center Y %"));
-                ui.add(egui::Slider::new(&mut fx.mask_size, 5.0..=100.0).text("Size %"));
-                ui.add(egui::Slider::new(&mut fx.mask_feather, 0.0..=80.0).text("Feather (px)"));
-                ui.checkbox(&mut fx.mask_invert, "Invert mask");
-            });
-        }
-
-        if show("light glow light leak strobe tilt-shift") {
-            ui.collapsing("Light", |ui| {
-                ui.add(egui::Slider::new(&mut fx.glow, 0.0..=100.0).text("Glow %"));
-                ui.add(egui::Slider::new(&mut fx.light_leak, 0.0..=100.0).text("Light leak %"));
-                ui.add(egui::Slider::new(&mut fx.strobe, 0.0..=100.0).text("Strobe %"));
-                ui.add(egui::Slider::new(&mut fx.tilt_shift, 0.0..=100.0).text("Tilt-shift %"));
-            });
-        }
-
-        if show("stylize sharpen duotone zoom blur") {
-            ui.collapsing("Stylize", |ui| {
-                ui.add(egui::Slider::new(&mut fx.sharpen, 0.0..=100.0).text("Sharpen %"));
-                ui.add(egui::Slider::new(&mut fx.duotone, 0.0..=100.0).text("Duotone amount %"));
-                ui.add(egui::Slider::new(&mut fx.zoom_blur, 0.0..=100.0).text("Zoom blur %"));
-            });
-        }
-
-        if show("transform zoom rotate flip mirror letterbox") {
-            ui.collapsing("Transform", |ui| {
-                ui.add(egui::Slider::new(&mut fx.zoom_pct, 100.0..=250.0).text("Zoom (push-in) %"));
-                ui.add(egui::Slider::new(&mut fx.rotate_deg, -180.0..=180.0).text("Rotate (°)"));
-                ui.checkbox(&mut fx.flip_h, "Flip Horizontal");
-                ui.checkbox(&mut fx.flip_v, "Flip Vertical");
-                ui.add(egui::Slider::new(&mut fx.letterbox, 0.0..=40.0).text("Letterbox %"));
-            });
-        }
-
-        if show("print neon halftone edges ripple rings") {
-            ui.collapsing("Print & neon", |ui| {
-                ui.add(egui::Slider::new(&mut fx.halftone_px, 0.0..=60.0).text("Halftone cell (px)"));
-                ui.add(egui::Slider::new(&mut fx.neon_edges, 0.0..=100.0).text("Neon edges %"));
-                ui.add(egui::Slider::new(&mut fx.ripple_rings, 0.0..=100.0).text("Ripple rings %"));
-            });
-        }
-
-        if show("color fx solarize threshold bleach bypass channel swap") {
-            ui.collapsing("Color FX", |ui| {
-                ui.add(egui::Slider::new(&mut fx.solarize, 0.0..=100.0).text("Solarize %"));
-                ui.add(egui::Slider::new(&mut fx.threshold_bw, 0.0..=100.0).text("Threshold (B/W) %"));
-                ui.add(egui::Slider::new(&mut fx.bleach_bypass, 0.0..=100.0).text("Bleach bypass %"));
-            });
-        }
-
-        if show("hue cycle tile repeat spotlight") {
-            ui.collapsing("Hue cycle, tile, spotlight", |ui| {
-                ui.add(egui::Slider::new(&mut fx.hue_cycle_speed, 0.0..=5.0).text("Hue cycle speed"));
-                ui.add(egui::Slider::new(&mut fx.tile_repeat, 1..=8).text("Tile repeat"));
-                ui.add(egui::Slider::new(&mut fx.spotlight_dark, 0.0..=100.0).text("Spotlight darkness %"));
-                ui.add(egui::Slider::new(&mut fx.spotlight_radius, 5.0..=100.0).text("Spotlight radius %"));
-            });
-        }
-
-        // BorisFX Sapphire S_ Light & Flares
-        if show("sapphire light flares s_glow s_glownoise s_glowrainbow s_gloworthicon s_halation s_glare s_glint s_sparkle s_flashbulb s_rays s_streaks s_lensflare s_edgerays s_lightleak") {
-            ui.collapsing("BorisFX Sapphire: Light & Flares (S_)", |ui| {
-                ui.add(egui::Slider::new(&mut fx.s_glow, 0.0..=100.0).text("S_Glow %"));
-                ui.add(egui::Slider::new(&mut fx.s_glow_noise, 0.0..=100.0).text("S_GlowNoise %"));
-                ui.add(egui::Slider::new(&mut fx.s_glow_rainbow, 0.0..=100.0).text("S_GlowRainbow %"));
-                ui.add(egui::Slider::new(&mut fx.s_glow_orthicon, 0.0..=100.0).text("S_GlowOrthicon (dark glow) %"));
-                ui.add(egui::Slider::new(&mut fx.s_halation, 0.0..=100.0).text("S_Halation %"));
-                ui.add(egui::Slider::new(&mut fx.s_glare, 0.0..=100.0).text("S_Glare %"));
-                ui.add(egui::Slider::new(&mut fx.s_glint, 0.0..=100.0).text("S_Glint %"));
-                ui.add(egui::Slider::new(&mut fx.s_sparkle, 0.0..=100.0).text("S_Sparkle %"));
-                ui.add(egui::Slider::new(&mut fx.s_flashbulb, 0.0..=100.0).text("S_Flashbulb %"));
-                ui.add(egui::Slider::new(&mut fx.s_rays, 0.0..=100.0).text("S_Rays %"));
-                ui.add(egui::Slider::new(&mut fx.s_streaks, 0.0..=100.0).text("S_Streaks %"));
-                ui.add(egui::Slider::new(&mut fx.s_lens_flare, 0.0..=100.0).text("S_LensFlare %"));
-                ui.add(egui::Slider::new(&mut fx.s_edge_rays, 0.0..=100.0).text("S_EdgeRays %"));
-                ui.add(egui::Slider::new(&mut fx.s_light_leak, 0.0..=100.0).text("S_LightLeak %"));
-            });
-        }
-
-        // BorisFX Sapphire S_ Blur & Distort / Warps
-        if show("sapphire blur distort warp s_warpwaves2 s_warpperspective s_warpfisheye s_warpmagnify s_warppolar s_warpbubble2 s_warpvortex s_warpchroma s_warppuddle s_warptransform s_warppuff s_blurdirectional s_blurradial s_blurmotion s_rackdefocus s_zblur s_edgeblur s_beauty") {
-            ui.collapsing("BorisFX Sapphire: Blur & Distort (S_)", |ui| {
-                ui.checkbox(&mut fx.wavesenabled, "S_WarpWaves2 (enable)");
-                ui.add(egui::Slider::new(&mut fx.wave_a_amp, -1.0..=1.0).text("S_WarpWaves2 A amplitude"));
-                ui.add(egui::Slider::new(&mut fx.wave_a_freq, 0.1..=40.0).text("S_WarpWaves2 A frequency"));
-                ui.add(egui::Slider::new(&mut fx.wave_b_amp, -1.0..=1.0).text("S_WarpWaves2 B amplitude"));
-                ui.checkbox(&mut fx.perspectiveenabled, "S_WarpPerspective (enable)");
-                ui.add(egui::Slider::new(&mut fx.persp_lat, -89.0..=89.0).text("S_WarpPerspective Latitude (°)"));
-                ui.add(egui::Slider::new(&mut fx.persp_swing, -360.0..=360.0).text("S_WarpPerspective Swing (°)"));
-                ui.add(egui::Slider::new(&mut fx.persp_roll, -360.0..=360.0).text("S_WarpPerspective Roll (°)"));
-                ui.add(egui::Slider::new(&mut fx.cube_rot_deg, 0.0..=90.0).text("Cube rotation (°)"));
-                ui.add(egui::Slider::new(&mut fx.s_fisheye, -3.0..=3.0).text("S_WarpFishEye"));
-                ui.add(egui::Slider::new(&mut fx.s_magnify, 0.0..=8.0).text("S_WarpMagnify"));
-                ui.checkbox(&mut fx.s_polar, "S_WarpPolar");
-                ui.add(egui::Slider::new(&mut fx.s_bubble2, 0.0..=2.0).text("S_WarpBubble2"));
-                ui.add(egui::Slider::new(&mut fx.s_vortex, -720.0..=720.0).text("S_WarpVortex (°)"));
-                ui.add(egui::Slider::new(&mut fx.s_warp_chroma, 0.0..=2.0).text("S_WarpChroma"));
-                ui.add(egui::Slider::new(&mut fx.s_warp_puddle, 0.0..=100.0).text("S_WarpPuddle %"));
-                ui.add(egui::Slider::new(&mut fx.s_warp_transform_rot, -180.0..=180.0).text("S_WarpTransform Rotate (°)"));
-                ui.add(egui::Slider::new(&mut fx.s_warp_puff, -100.0..=100.0).text("S_WarpPuff %"));
-                ui.add(egui::Slider::new(&mut fx.s_blur_dir, 0.0..=100.0).text("S_BlurDirectional %"));
-                ui.add(egui::Slider::new(&mut fx.s_blur_rad, 0.0..=100.0).text("S_BlurRadial %"));
-                ui.add(egui::Slider::new(&mut fx.s_blur_motion, 0.0..=100.0).text("S_BlurMotion %"));
-                ui.add(egui::Slider::new(&mut fx.s_rack_defocus, 0.0..=100.0).text("S_RackDefocus %"));
-                ui.add(egui::Slider::new(&mut fx.s_z_blur, 0.0..=100.0).text("S_ZBlur %"));
-                ui.add(egui::Slider::new(&mut fx.s_edge_blur, 0.0..=100.0).text("S_EdgeBlur %"));
-                ui.add(egui::Slider::new(&mut fx.s_beauty, 0.0..=100.0).text("S_Beauty (skin smoothing) %"));
-            });
-        }
-
-        // BorisFX Sapphire S_ Stylize, Render & Composite
-        if show("sapphire stylize render composite s_quadtone s_multitone s_tritone s_zebrafy s_pixelsort s_embossdistort s_embossshiny s_zap s_aurora s_caustics s_clouds s_texturecells s_autopaint s_cartoon s_etching s_scanlines s_filmdamage s_shake s_psykostripes s_psykoblobs") {
-            ui.collapsing("BorisFX Sapphire: Stylize & Render (S_)", |ui| {
-                ui.add(egui::Slider::new(&mut fx.s_quadtone, 0.0..=100.0).text("S_QuadTone %"));
-                ui.add(egui::Slider::new(&mut fx.s_multitone, 0.0..=100.0).text("S_MultiTone %"));
-                ui.add(egui::Slider::new(&mut fx.s_tritone, 0.0..=100.0).text("S_TriTone %"));
-                ui.add(egui::Slider::new(&mut fx.s_zebrafy, 0.0..=100.0).text("S_Zebrafy %"));
-                ui.add(egui::Slider::new(&mut fx.s_pixel_sort, 0.0..=100.0).text("S_PixelSort %"));
-                ui.add(egui::Slider::new(&mut fx.s_emboss_distort, 0.0..=100.0).text("S_EmbossDistort %"));
-                ui.add(egui::Slider::new(&mut fx.s_emboss_shiny, 0.0..=100.0).text("S_EmbossShiny %"));
-                ui.add(egui::Slider::new(&mut fx.s_zap, 0.0..=100.0).text("S_Zap (lightning) %"));
-                ui.add(egui::Slider::new(&mut fx.s_aurora, 0.0..=100.0).text("S_Aurora %"));
-                ui.add(egui::Slider::new(&mut fx.s_caustics, 0.0..=100.0).text("S_Caustics %"));
-                ui.add(egui::Slider::new(&mut fx.s_clouds, 0.0..=100.0).text("S_Clouds %"));
-                ui.add(egui::Slider::new(&mut fx.s_texture_cells, 0.0..=100.0).text("S_TextureCells %"));
-                ui.add(egui::Slider::new(&mut fx.s_auto_paint, 0.0..=100.0).text("S_AutoPaint %"));
-                ui.add(egui::Slider::new(&mut fx.s_cartoon, 0.0..=100.0).text("S_Cartoon %"));
-                ui.add(egui::Slider::new(&mut fx.s_etching, 0.0..=100.0).text("S_Etching %"));
-                ui.add(egui::Slider::new(&mut fx.s_scanlines, 0.0..=100.0).text("S_ScanLines %"));
-                ui.add(egui::Slider::new(&mut fx.s_film_damage, 0.0..=100.0).text("S_FilmDamage %"));
-                ui.add(egui::Slider::new(&mut fx.s_shake, 0.0..=100.0).text("S_Shake %"));
-                ui.checkbox(&mut fx.s_psyko_stripes, "S_PsykoStripes");
-                ui.checkbox(&mut fx.s_psyko_blobs, "S_PsykoBlobs");
-            });
-        }
-
-        if show("universe chromatic glow edge glow starglow holomatrix rgb separation heatwave glitch noir retrograde") {
-            ui.collapsing("Universe: Glow, Distort & Stylize", |ui| {
-                ui.add(egui::Slider::new(&mut fx.u_chromatic_glow, 0.0..=100.0).text("Chromatic Glow %"));
-                ui.add(egui::Slider::new(&mut fx.u_edge_glow, 0.0..=100.0).text("Edge Glow %"));
-                ui.add(egui::Slider::new(&mut fx.u_starglow, 0.0..=100.0).text("Starglow %"));
-                ui.add(egui::Slider::new(&mut fx.u_holomatrix, 0.0..=100.0).text("Holomatrix %"));
-                ui.add(egui::Slider::new(&mut fx.u_rgb_sep, 0.0..=100.0).text("RGB Separation %"));
-                ui.add(egui::Slider::new(&mut fx.u_heatwave, 0.0..=100.0).text("Heatwave %"));
-                ui.add(egui::Slider::new(&mut fx.u_glitch, 0.0..=100.0).text("Universe Glitch %"));
-                ui.add(egui::Slider::new(&mut fx.u_noir, 0.0..=100.0).text("Noir %"));
-                ui.add(egui::Slider::new(&mut fx.u_retrograde, 0.0..=100.0).text("RetroGrade %"));
-            });
-        }
-
-        if show("continuum film grain damage vignette glow lightning laser halftone pencil mosaic median falsecolor") {
-            ui.collapsing("Continuum: Film, Light & Stylize", |ui| {
-                ui.add(egui::Slider::new(&mut fx.bcc_film_grain, 0.0..=100.0).text("BCC Film Grain %"));
-                ui.add(egui::Slider::new(&mut fx.bcc_film_damage, 0.0..=100.0).text("BCC Film Damage %"));
-                ui.add(egui::Slider::new(&mut fx.bcc_vignette, 0.0..=100.0).text("BCC Vignette %"));
-                ui.add(egui::Slider::new(&mut fx.bcc_glow, 0.0..=100.0).text("BCC Glow %"));
-                ui.add(egui::Slider::new(&mut fx.bcc_lightning, 0.0..=100.0).text("BCC Lightning %"));
-                ui.add(egui::Slider::new(&mut fx.bcc_laser, 0.0..=100.0).text("BCC Laser %"));
-                ui.add(egui::Slider::new(&mut fx.bcc_halftone, 0.0..=100.0).text("BCC Halftone %"));
-                ui.add(egui::Slider::new(&mut fx.bcc_pencil, 0.0..=100.0).text("BCC Pencil %"));
-                ui.add(egui::Slider::new(&mut fx.bcc_mosaic, 0.0..=100.0).text("BCC Mosaic %"));
-                ui.add(egui::Slider::new(&mut fx.bcc_median, 0..=3).text("BCC Median passes"));
-                ui.add(egui::Slider::new(&mut fx.bcc_falsecolor, 0.0..=100.0).text("BCC Falsecolor %"));
-            });
-        }
-
-        if show("tv simulator crt curvature scanlines phosphor bloom bleed noise") {
-            ui.collapsing("TV simulator (CRT)", |ui| {
-                ui.checkbox(&mut fx.crtenabled, "Enable CRT Simulator");
-                ui.add(egui::Slider::new(&mut fx.crt_curvature, 0.0..=1.0).text("Screen curvature"));
-                ui.add(egui::Slider::new(&mut fx.crt_scanlines, 0.0..=1.0).text("Scanline strength"));
-                ui.add(egui::Slider::new(&mut fx.crt_phosphor, 0.0..=1.0).text("RGB phosphor mask"));
-                ui.add(egui::Slider::new(&mut fx.crt_bloom, 0.0..=1.0).text("Bloom / glow"));
-                ui.add(egui::Slider::new(&mut fx.crt_bleed, 0.0..=12.0).text("Chroma bleed (px)"));
-                ui.add(egui::Slider::new(&mut fx.crt_noise, 0.0..=1.0).text("Static noise"));
-            });
-        }
-    }
-
-    fn render_lib_transitions(&mut self, ui: &mut egui::Ui) {
-        let Some(idx) = self.selected_clip_idx else {
-            ui.label("Select a clip on V1 first.");
-            return;
-        };
-        let fx = &mut self.clips[idx].fx;
-        ui.heading("Transition (Standard & Sapphire S_ Transitions)");
-        egui::ComboBox::from_label("Transition type")
-            .selected_text(fx.transition.label())
-            .show_ui(ui, |ui| {
-                for &tr in TransitionType::ALL {
-                    ui.selectable_value(&mut fx.transition, tr, tr.label());
-                }
-            });
-        ui.add(egui::Slider::new(&mut fx.transition_dur, 0.1..=3.0).text("Duration (s)"));
-    }
-
-    fn render_lib_text(&mut self, ui: &mut egui::Ui) {
-        ui.heading("Text overlay");
-        ui.text_edit_singleline(&mut self.draft_text.text);
-        ui.add(egui::Slider::new(&mut self.draft_text.size_pct, 3.0..=25.0).text("Size (% of height)"));
-        ui.add(egui::Slider::new(&mut self.draft_text.x_pct, 0.0..=100.0).text("X %"));
-        ui.add(egui::Slider::new(&mut self.draft_text.y_pct, 0.0..=100.0).text("Y %"));
-        ui.horizontal(|ui| {
-            ui.label("Start (s):");
-            ui.add(egui::DragValue::new(&mut self.draft_text.start_sec).speed(0.1));
-            ui.label("End (s, 0=end):");
-            ui.add(egui::DragValue::new(&mut self.draft_text.end_sec).speed(0.1));
-            ui.color_edit_button_srgb(&mut self.draft_text.color);
-        });
-        if ui.button("+ Add text").clicked() {
-            self.push_undo();
-            self.text_overlays.push(self.draft_text.clone());
-        }
-        ui.separator();
-        let mut remove_idx = None;
-        for (i, tx) in self.text_overlays.iter().enumerate() {
-            ui.horizontal(|ui| {
-                ui.label(format!("“{}” ({:.1}s)", tx.text, tx.start_sec));
-                if ui.button("✕").clicked() {
-                    remove_idx = Some(i);
-                }
-            });
-        }
-        if let Some(i) = remove_idx {
-            self.push_undo();
-            self.text_overlays.remove(i);
-        }
-    }
-
-    fn render_lib_adjust(&mut self, ui: &mut egui::Ui) {
-        let Some(idx) = self.selected_clip_idx else {
-            ui.label("Select a clip on V1 first.");
-            return;
-        };
-        let fx = &mut self.clips[idx].fx;
-        ui.heading("Color & Grade");
-        ui.add(egui::Slider::new(&mut fx.brightness, 0.0..=200.0).text("Brightness (%)"));
-        ui.add(egui::Slider::new(&mut fx.contrast, 0.0..=200.0).text("Contrast (%)"));
-        ui.add(egui::Slider::new(&mut fx.saturation, 0.0..=300.0).text("Saturation (%)"));
-        ui.add(egui::Slider::new(&mut fx.hue_deg, 0.0..=360.0).text("Hue (°)"));
-        ui.add(egui::Slider::new(&mut fx.temperature, -100.0..=100.0).text("Temperature (cool ↔ warm)"));
-        ui.add(egui::Slider::new(&mut fx.tint, -100.0..=100.0).text("Tint (green ↔ magenta)"));
-        egui::ComboBox::from_label("Look")
-            .selected_text(fx.look.label())
-            .show_ui(ui, |ui| {
-                for &lk in VideoLook::ALL {
-                    ui.selectable_value(&mut fx.look, lk, lk.label());
-                }
-            });
-        ui.separator();
-        ui.heading("Color Wheels & HSL");
-        ui.add(egui::Slider::new(&mut fx.wheel_shadows[0], -1.0..=1.0).text("Shadows Tint X"));
-        ui.add(egui::Slider::new(&mut fx.wheel_midtones[0], -1.0..=1.0).text("Midtones Tint X"));
-        ui.add(egui::Slider::new(&mut fx.wheel_highlights[0], -1.0..=1.0).text("Highlights Tint X"));
-        ui.add(egui::Slider::new(&mut fx.hsl_hue_shift, -100.0..=100.0).text("HSL Hue Shift"));
-        ui.add(egui::Slider::new(&mut fx.hsl_sat_shift, -100.0..=100.0).text("HSL Saturation"));
-        ui.add(egui::Slider::new(&mut fx.hsl_lum_shift, -100.0..=100.0).text("HSL Luminance"));
-    }
-
-    fn render_lib_openfx(&mut self, ui: &mut egui::Ui) {
-        ui.heading("OpenFX (OFX 1.4 / 1.5) Native Plugin Host");
-        ui.label("Loads third-party .ofx.bundle plugins (BorisFX Sapphire OFX, Continuum OFX, RE:Vision, TuttleOFX, etc.) via the native C ABI.");
-        ui.add_space(6.0);
-
-        ui.horizontal(|ui| {
-            if ui.button("🔄 Rescan OFX Paths").clicked() {
-                self.ofx_plugins = scan_ofx_directories(&self.ofx_extra_dirs);
-                self.set_status(
-                    format!("Scanned OpenFX directories: {} plugin(s) found.", self.ofx_plugins.len()),
-                    false,
-                );
-            }
-            if ui.button("📂 Load .ofx.bundle...").clicked() {
-                if let Some(bundle_dir) = rfd::FileDialog::new().pick_folder() {
-                    if bundle_dir.to_string_lossy().ends_with(".ofx.bundle") {
-                        let name = bundle_dir
-                            .file_name()
-                            .map(|n| n.to_string_lossy().to_string())
-                            .unwrap_or_else(|| "Custom.ofx.bundle".into());
-                        let mac_bin = bundle_dir
-                            .join("Contents")
-                            .join("MacOS")
-                            .join(format!("{}.ofx", name.trim_end_matches(".ofx.bundle")));
-                        let loaded = inspect_ofx_binary(&name, &bundle_dir, &mac_bin);
-                        let count = loaded.len();
-                        self.ofx_plugins.extend(loaded);
-                        self.set_status(format!("Loaded {} plugin(s) from {}", count, name), false);
-                    } else {
-                        self.ofx_extra_dirs.push(bundle_dir);
-                        self.ofx_plugins = scan_ofx_directories(&self.ofx_extra_dirs);
-                    }
-                }
-            }
-        });
-
-        ui.add_space(6.0);
-        ui.collapsing("Search Paths (/Library/OFX/Plugins & OFX_PLUGIN_PATH)", |ui| {
-            for p in default_ofx_searchpaths() {
-                ui.label(format!("• {}", p.display()));
-            }
-            for p in &self.ofx_extra_dirs {
-                ui.label(format!("• {} (custom)", p.display()));
-            }
-        });
-
-        ui.separator();
-        if self.ofx_plugins.is_empty() {
-            ui.label("No third-party .ofx.bundle plugins installed in /Library/OFX/Plugins yet.");
-            ui.label("Install any macOS arm64 OFX bundle into /Library/OFX/Plugins or click 'Load .ofx.bundle...' above.");
-        } else {
-            for (p_idx, plug) in self.ofx_plugins.iter_mut().enumerate() {
-                egui::Frame::group(ui.style()).show(ui, |ui| {
-                    ui.horizontal(|ui| {
-                        let mut active = self.active_ofx_identifiers.contains(&plug.identifier);
-                        if ui.checkbox(&mut active, &plug.identifier).changed() {
-                            if active {
-                                self.active_ofx_identifiers.push(plug.identifier.clone());
-                            } else {
-                                self.active_ofx_identifiers.retain(|id| id != &plug.identifier);
-                            }
-                        }
-                        if ui.selectable_label(self.selected_ofx_plugin_idx == p_idx, "⚙ Properties").clicked() {
-                            self.selected_ofx_plugin_idx = p_idx;
-                        }
-                    });
-                    ui.small(format!(
-                        "Bundle: {} | API: {} v{} | Plugin v{}.{}",
-                        plug.bundlename,
-                        plug.apiname,
-                        plug.api_version,
-                        plug.version_major,
-                        plug.version_minor
-                    ));
-                    ui.small(format!("Status: {}", plug.status));
-
-                    // Interactive OpenFX Plugin Properties Inspector
-                    ui.collapsing(format!("Plugin Properties ({})", plug.params.len()), |ui| {
-                        for param in &mut plug.params {
-                            ui.add(
-                                egui::Slider::new(&mut param.value, param.min..=param.max)
-                                    .text(&param.label),
+                match self.phase {
+                    AppPhase::Splash => {
+                        // fade the whole composition in over the first 0.6s
+                        let fade = (self.phase_t / 0.6).min(1.0);
+                        let alpha = (255.0 * fade) as u8;
+                        if let Some(logo) = &self.logo_tex {
+                            let lr = Rect::from_center_size(pos2(cx, cy - 30.0), vec2(150.0, 150.0));
+                            p.image(
+                                logo.id(),
+                                lr,
+                                uv,
+                                Color32::from_rgba_unmultiplied(255, 255, 255, alpha),
                             );
                         }
-                        if ui.button("↺ Reset Plugin Properties").clicked() {
-                            for param in &mut plug.params {
-                                param.value = param.default_val;
-                            }
-                        }
-                    });
-                });
+                        p.text(
+                            pos2(cx, cy + 72.0),
+                            egui::Align2::CENTER_CENTER,
+                            "Grain",
+                            FontId::proportional(48.0),
+                            Color32::from_rgba_unmultiplied(236, 236, 236, alpha),
+                        );
+                        p.text(
+                            pos2(cx, cy + 112.0),
+                            egui::Align2::CENTER_CENTER,
+                            "VIDEO EDITOR",
+                            FontId::proportional(12.0),
+                            Color32::from_rgba_unmultiplied(150, 165, 185, alpha),
+                        );
+                        // subtle "Loading…" hint at the bottom
+                        p.text(
+                            pos2(cx, screen.bottom() - 28.0),
+                            egui::Align2::CENTER_CENTER,
+                            "Loading…",
+                            FontId::proportional(11.0),
+                            Color32::from_rgba_unmultiplied(120, 120, 120, alpha),
+                        );
+                    }
+                    AppPhase::Loading => {
+                        p.text(
+                            pos2(cx, cy - 34.0),
+                            egui::Align2::CENTER_CENTER,
+                            "Grain",
+                            FontId::proportional(30.0),
+                            TEXT_WHITE,
+                        );
+                        let prog = (self.phase_t / 1.8).min(1.0);
+                        let bar_w = 280.0;
+                        let bar = Rect::from_min_size(pos2(cx - bar_w / 2.0, cy + 6.0), vec2(bar_w, 6.0));
+                        p.rect_filled(bar, 3.0, Color32::from_rgb(38, 38, 38));
+                        p.rect_filled(
+                            Rect::from_min_size(bar.min, vec2(bar_w * prog, 6.0)),
+                            3.0,
+                            ACCENT_BLUE,
+                        );
+                        p.text(
+                            pos2(cx, cy + 28.0),
+                            egui::Align2::CENTER_CENTER,
+                            format!("Loading project… {:.0}%", prog * 100.0),
+                            FontId::proportional(11.0),
+                            TEXT_DIM,
+                        );
+                    }
+                    AppPhase::Ready => {}
+                }
+            });
+    }
+
+    // Draw a Marlett UI glyph (window min/max/restore/close) into `rect`. Uses
+    // the real Marlett font when it was loaded, otherwise draws the equivalent
+    // shape with the painter so the chrome looks identical on any host.
+    fn draw_marlett(&self, p: &egui::Painter, rect: Rect, glyph: MarlettGlyph, color: Color32) {
+        if self.marlett_loaded {
+            let ch = match glyph {
+                MarlettGlyph::Minimize => '0',
+                MarlettGlyph::Maximize => '1',
+                MarlettGlyph::Restore => '2',
+                MarlettGlyph::Close => 'r',
+            };
+            p.text(
+                rect.center(),
+                egui::Align2::CENTER_CENTER,
+                ch.to_string(),
+                FontId::new(13.0, egui::FontFamily::Name("Marlett".into())),
+                color,
+            );
+        } else {
+            let s = Stroke::new(1.4_f32, color);
+            match glyph {
+                MarlettGlyph::Minimize => {
+                    p.line_segment(
+                        [
+                            pos2(rect.left() + 5.0, rect.center().y + 3.0),
+                            pos2(rect.right() - 5.0, rect.center().y + 3.0),
+                        ],
+                        s,
+                    );
+                }
+                MarlettGlyph::Maximize => {
+                    p.rect_stroke(rect.shrink(5.0), 1.0, s);
+                }
+                MarlettGlyph::Restore => {
+                    let a = Rect::from_min_size(rect.min + vec2(5.0, 3.0), vec2(9.0, 7.0));
+                    let b = Rect::from_min_size(rect.min + vec2(8.0, 6.0), vec2(9.0, 7.0));
+                    p.rect_stroke(b, 1.0, s);
+                    p.line_segment([a.left_top(), a.right_top()], s);
+                    p.line_segment([a.left_top(), a.left_bottom()], s);
+                }
+                MarlettGlyph::Close => {
+                    let a = rect.shrink(5.0);
+                    p.line_segment([a.left_top(), a.right_bottom()], s);
+                    p.line_segment([a.right_top(), a.left_bottom()], s);
+                }
             }
         }
     }
+}
 
-    fn render_lib_export(&mut self, ui: &mut egui::Ui) {
-        ui.heading("Output (Rust + macOS VideoToolbox)");
-        ui.add_space(4.0);
+// Decode an embedded PNG (include_bytes!) into an egui GPU texture.
+fn load_embedded_png(
+    ctx: &egui::Context,
+    name: &str,
+    bytes: &[u8],
+) -> Option<egui::TextureHandle> {
+    let img = image::load_from_memory(bytes).ok()?;
+    let rgba = img.to_rgba8();
+    let (w, h) = rgba.dimensions();
+    let image = egui::ColorImage::from_rgba_unmultiplied([w as usize, h as usize], rgba.as_raw());
+    Some(ctx.load_texture(name, image, egui::TextureOptions::default()))
+}
 
-        egui::ComboBox::from_label("Container")
-            .selected_text(self.video_export.container.label())
-            .show_ui(ui, |ui| {
-                for &c in ContainerFormat::ALL {
-                    ui.selectable_value(&mut self.video_export.container, c, c.label());
+// ===========================================================================
+// eframe::App
+// ===========================================================================
+
+impl eframe::App for VegasApp {
+    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        // --- one-time asset init: Marlett font + Grain brand textures -------
+        self.ensure_assets(ctx);
+
+        // --- Vegas dark visuals + blue selection accent --------------------
+        let mut v = egui::Visuals::dark();
+        v.panel_fill = PANEL_DARK;
+        v.window_fill = Color32::from_rgb(34, 34, 34);
+        v.faint_bg_color = Color32::from_rgb(40, 40, 40);
+        v.extreme_bg_color = LIST_BG;
+        v.widgets.noninteractive.bg_fill = Color32::from_rgb(33, 33, 33);
+        v.widgets.noninteractive.fg_stroke = Stroke::new(1.0_f32, TEXT_LIGHT);
+        v.widgets.inactive.bg_fill = Color32::from_rgb(48, 48, 48);
+        v.widgets.inactive.fg_stroke = Stroke::new(1.0_f32, TEXT_LIGHT);
+        v.widgets.hovered.bg_fill = Color32::from_rgb(64, 64, 64);
+        v.widgets.hovered.fg_stroke = Stroke::new(1.0_f32, TEXT_WHITE);
+        v.widgets.active.bg_fill = FX_BLUE;
+        v.widgets.active.fg_stroke = Stroke::new(1.0_f32, TEXT_WHITE);
+        v.selection.bg_fill = FX_BLUE;
+        v.selection.stroke = Stroke::new(1.0_f32, Color32::from_rgb(120, 170, 220));
+        v.window_stroke = Stroke::new(1.0_f32, Color32::from_rgb(20, 20, 20));
+        ctx.set_visuals(v);
+        // slimmer, flatter scrollbars (Vegas style)
+        ctx.style_mut(|s| {
+            s.spacing.scroll.floating = false;
+            s.spacing.scroll.bar_width = 10.0;
+            s.spacing.scroll.bar_inner_margin = 2.0;
+            s.spacing.scroll.bar_outer_margin = 0.0;
+            s.spacing.scroll.handle_min_length = 18.0;
+        });
+
+        // --- start-up phase machine (Splash -> Loading -> Ready) ------------
+        let dt = ctx.input(|i| i.stable_dt).min(0.1);
+        self.phase_t += dt;
+        match self.phase {
+            AppPhase::Splash => {
+                if self.phase_t >= 2.6 {
+                    self.phase = AppPhase::Loading;
+                    self.phase_t = 0.0;
+                }
+            }
+            AppPhase::Loading => {
+                if self.phase_t >= 1.8 {
+                    self.phase = AppPhase::Ready;
+                    self.phase_t = 0.0;
+                }
+            }
+            AppPhase::Ready => {}
+        }
+        if self.phase != AppPhase::Ready {
+            self.render_splash_or_loading(ctx);
+            ctx.request_repaint(); // keep the phase timer advancing
+            return;
+        }
+
+        // --- playback clock (fixed) ----------------------------------------
+        // Advances the playhead by real elapsed time, wraps inside the loop
+        // region when one is set, stops at the project end, and drives the
+        // master meter. When stopped, the meter decays back to silence so the
+        // mixer does not freeze on a stale reading.
+        if self.is_playing {
+            self.playhead_sec += dt as f64;
+            let total = self.total_dur();
+            let looping = self.loop_end > self.loop_start;
+            if looping && self.playhead_sec >= self.loop_end {
+                self.playhead_sec = self.loop_start;
+            } else if self.playhead_sec >= total {
+                self.playhead_sec = total;
+                self.is_playing = false;
+            }
+            self.frame = (self.playhead_sec * self.fps as f64) as u64;
+            // simulate an output level from the active (non-muted) tracks so
+            // the master meter reacts to transport state, not a free sine.
+            let mut lvl = 0.0_f32;
+            for (i, t) in self.tracks.iter().enumerate() {
+                if !t.muted {
+                    lvl += 0.18 + 0.12 * (self.playhead_sec as f32 * 4.3 + i as f32).sin().abs();
+                }
+            }
+            self.master_level = lvl.clamp(0.0, 1.0);
+            ctx.request_repaint();
+        } else {
+            // meter decay
+            self.master_level = (self.master_level - dt * 1.8).max(0.0);
+        }
+
+        // --- keyboard (only when not typing into a text field) -------------
+        if !ctx.wants_keyboard_input() {
+            let (space, home, end, left, right) = ctx.input(|i| {
+                (
+                    i.key_pressed(egui::Key::Space),
+                    i.key_pressed(egui::Key::Home),
+                    i.key_pressed(egui::Key::End),
+                    i.key_pressed(egui::Key::ArrowLeft),
+                    i.key_pressed(egui::Key::ArrowRight),
+                )
+            });
+            let total = self.total_dur();
+            if space {
+                self.is_playing = !self.is_playing;
+            }
+            if home {
+                self.playhead_sec = 0.0;
+            }
+            if end {
+                self.playhead_sec = total;
+            }
+            if left {
+                self.playhead_sec = (self.playhead_sec - 1.0 / self.fps as f64).max(0.0);
+            }
+            if right {
+                self.playhead_sec = (self.playhead_sec + 1.0 / self.fps as f64).min(total);
+            }
+        }
+
+        // === top stack (order: title, menu, toolbar) =======================
+        self.render_title_strip(ctx);
+        self.render_menu_bar(ctx);
+        self.render_toolbar(ctx);
+
+        // === bottom stack (order matters: transport first -> it sits at the
+        //     very bottom edge; timeline second -> it sits ABOVE transport) ==
+        self.render_transport_bar(ctx);
+        self.render_timeline(ctx);
+
+        // === middle row (side panels + central preview) ====================
+        if self.show_dock {
+            egui::SidePanel::left("vegas_dock")
+                .min_width(320.0)
+                .default_width(420.0)
+                .resizable(true)
+                .show(ctx, |ui| {
+                    self.render_dock(ui);
+                });
+        }
+        if self.show_mixer {
+            egui::SidePanel::right("vegas_mixer")
+                .min_width(120.0)
+                .default_width(150.0)
+                .resizable(true)
+                .show(ctx, |ui| {
+                    self.render_master_bus(ui);
+                });
+        }
+
+        egui::CentralPanel::default().show(ctx, |ui| {
+            self.render_preview(ui);
+        });
+
+        // --- status toast --------------------------------------------------
+        if !self.status.is_empty() {
+            egui::Area::new(egui::Id::new("vegas_status_toast"))
+                .order(egui::Order::Foreground)
+                .fixed_pos(egui::pos2(12.0, 6.0))
+                .show(ctx, |ui| {
+                    ui.painter().rect_filled(
+                        ui.max_rect(),
+                        Rounding::same(3.0),
+                        Color32::from_rgba_unmultiplied(0, 0, 0, 170),
+                    );
+                    ui.add_space(2.0);
+                    ui.label(
+                        egui::RichText::new(&self.status)
+                            .color(TEXT_LIGHT)
+                            .size(11.0),
+                    );
+                    ui.add_space(2.0);
+                });
+        }
+    }
+}
+
+// ===========================================================================
+// Title strip / menu bar / toolbar (screenshot 1 + 2 chrome)
+// ===========================================================================
+
+impl VegasApp {
+    fn render_title_strip(&mut self, ctx: &egui::Context) {
+        egui::TopBottomPanel::top("vegas_title")
+            .exact_height(24.0)
+            .show(ctx, |ui| {
+                let rect = ui.max_rect();
+                ui.painter().rect_filled(rect, 0.0, TITLE_BAR);
+
+                // app icon (blue square + magenta accent) like the VEGAS glyph
+                let icon_rect = Rect::from_min_size(
+                    pos2(rect.min.x + 8.0, rect.center().y - 7.0),
+                    Vec2::new(14.0, 14.0),
+                );
+                ui.painter().rect_filled(icon_rect, 1.0, ACCENT_BLUE);
+                ui.painter().rect_filled(
+                    Rect::from_min_size(
+                        pos2(icon_rect.center().x - 1.0, icon_rect.min.y + 2.0),
+                        Vec2::new(6.0, 6.0),
+                    ),
+                    1.0,
+                    Color32::from_rgb(190, 70, 160),
+                );
+
+                ui.painter().text(
+                    pos2(rect.min.x + 30.0, rect.center().y),
+                    egui::Align2::LEFT_CENTER,
+                    "45% - Untitled - VEGAS Pro 17.0",
+                    FontId::proportional(12.0),
+                    TEXT_WHITE,
+                );
+
+                // Window caption buttons drawn with Marlett glyphs (the real
+                // font when present on the host, otherwise drawn shapes that
+                // look identical). Close exits the reference app.
+                let p = ui.painter();
+                let mut x = rect.max.x;
+                for (glyph, col, id) in [
+                    (MarlettGlyph::Close, Color32::from_rgb(232, 80, 80), "win_close"),
+                    (MarlettGlyph::Maximize, TEXT_LIGHT, "win_max"),
+                    (MarlettGlyph::Minimize, TEXT_LIGHT, "win_min"),
+                ] {
+                    let r = Rect::from_min_size(pos2(x - 16.0, rect.min.y), Vec2::new(16.0, 24.0));
+                    let resp = ui.interact(r, egui::Id::new(id), Sense::click());
+                    if resp.hovered() {
+                        p.rect_filled(r, 0.0, Color32::from_rgb(40, 40, 40));
+                    }
+                    self.draw_marlett(p, r, glyph, col);
+                    if id == "win_close" && resp.clicked() {
+                        std::process::exit(0);
+                    }
+                    x -= 16.0;
                 }
             });
+    }
 
-        egui::ComboBox::from_label("Video codec")
-            .selected_text(self.video_export.video_codec.label())
-            .show_ui(ui, |ui| {
-                for &vc in VideoCodec::ALL {
-                    ui.selectable_value(&mut self.video_export.video_codec, vc, vc.label());
-                }
+    fn render_menu_bar(&mut self, ctx: &egui::Context) {
+        egui::TopBottomPanel::top("vegas_menu")
+            .exact_height(22.0)
+            .show(ctx, |ui| {
+                ui.painter().rect_filled(ui.max_rect(), 0.0, MENU_BAR);
+                ui.spacing_mut().item_spacing = Vec2::new(14.0, 0.0);
+                ui.add_space(2.0);
+                ui.horizontal(|ui| {
+                    for &m in &["File", "Edit", "View", "Insert", "Tools", "Options", "Help"] {
+                        ui.menu_button(m, |ui| {
+                            self.menu_items(ui, m);
+                        });
+                    }
+                });
             });
+    }
 
-        egui::ComboBox::from_label("Audio codec")
-            .selected_text(self.video_export.audio_codec.label())
-            .show_ui(ui, |ui| {
-                for &ac in VideoAudioCodec::ALL {
-                    ui.selectable_value(&mut self.video_export.audio_codec, ac, ac.label());
+    fn menu_items(&mut self, ui: &mut Ui, menu: &str) {
+        ui.style_mut().spacing.item_spacing = Vec2::new(8.0, 3.0);
+        match menu {
+            "File" => {
+                if ui.button("New Project").clicked() {
+                    self.set_status("New project (demo)");
+                    ui.close_menu();
                 }
-            });
-
-        egui::ComboBox::from_label("Resolution")
-            .selected_text(self.video_export.resolution.label())
-            .show_ui(ui, |ui| {
-                for &res in ResolutionPreset::ALL {
-                    ui.selectable_value(&mut self.video_export.resolution, res, res.label());
+                if ui.button("Open...").clicked() {
+                    self.set_status("Open (demo)");
+                    ui.close_menu();
                 }
-            });
+                if ui.button("Save").clicked() {
+                    self.set_status("Saved (demo)");
+                    ui.close_menu();
+                }
+                if ui.button("Save As...").clicked() {
+                    self.set_status("Save As (demo)");
+                    ui.close_menu();
+                }
+                ui.separator();
+                if ui.button("Exit").clicked() {
+                    std::process::exit(0);
+                }
+            }
+            "Edit" => {
+                if ui.button("Undo").clicked() {
+                    self.set_status("Undo (demo)");
+                    ui.close_menu();
+                }
+                if ui.button("Redo").clicked() {
+                    self.set_status("Redo (demo)");
+                    ui.close_menu();
+                }
+                ui.separator();
+                ui.add_enabled(false, egui::Button::new("Cut"));
+                ui.add_enabled(false, egui::Button::new("Copy"));
+                ui.add_enabled(false, egui::Button::new("Paste"));
+                if ui.button("Delete").clicked() {
+                    self.set_status("Delete selected (demo)");
+                    ui.close_menu();
+                }
+                ui.separator();
+                if ui.button("Split (S)").clicked() {
+                    self.set_status("Split at playhead (demo)");
+                    ui.close_menu();
+                }
+            }
+            "View" => {
+                ui.checkbox(&mut self.show_dock, "Docked Window");
+                ui.checkbox(&mut self.show_preview, "Video Preview");
+                ui.checkbox(&mut self.show_mixer, "Master Bus");
+                ui.separator();
+                if ui.button("Zoom In").clicked() {
+                    self.tl_zoom *= 1.25;
+                    ui.close_menu();
+                }
+                if ui.button("Zoom Out").clicked() {
+                    self.tl_zoom /= 1.25;
+                    ui.close_menu();
+                }
+            }
+            "Insert" => {
+                if ui.button("Import Media...").clicked() {
+                    self.set_status("Import media (demo)");
+                    ui.close_menu();
+                }
+                if ui.button("Video Track").clicked() {
+                    self.set_status("Insert video track (demo)");
+                    ui.close_menu();
+                }
+                if ui.button("Audio Track").clicked() {
+                    self.set_status("Insert audio track (demo)");
+                    ui.close_menu();
+                }
+                if ui.button("Text Media").clicked() {
+                    self.set_status("Insert text (demo)");
+                    ui.close_menu();
+                }
+            }
+            "Tools" => {
+                ui.add_enabled(false, egui::Button::new("Video Scopes"));
+                ui.add_enabled(false, egui::Button::new("Beep Mapper"));
+                ui.add_enabled(false, egui::Button::new("Media Manager"));
+            }
+            "Options" => {
+                if ui.button("Preferences...").clicked() {
+                    self.set_status("Preferences (demo)");
+                    ui.close_menu();
+                }
+            }
+            "Help" => {
+                if ui.button("About Vegas Pro Reference").clicked() {
+                    self.set_status("Pure Rust + egui 0.29 reference shell");
+                    ui.close_menu();
+                }
+            }
+            _ => {}
+        }
+    }
 
-        ui.add(egui::Slider::new(&mut self.video_export.fps, 24..=120).text("Frame rate (fps)"));
-        ui.checkbox(
-            &mut self.video_export.auto_bitrate,
-            "Auto bitrate (recommended)",
+    fn render_toolbar(&mut self, ctx: &egui::Context) {
+        egui::TopBottomPanel::top("vegas_toolbar")
+            .exact_height(32.0)
+            .show(ctx, |ui| {
+                ui.painter().rect_filled(ui.max_rect(), 0.0, TOOLBAR);
+                ui.spacing_mut().item_spacing = Vec2::new(2.0, 0.0);
+                ui.add_space(2.0);
+                ui.horizontal(|ui| {
+                    if toolbar_btn(ui, "New", "New project") {
+                        self.set_status("New project (demo)");
+                    }
+                    if toolbar_btn(ui, "Open", "Open project") {
+                        self.set_status("Open project (demo)");
+                    }
+                    if toolbar_btn(ui, "Save", "Save project") {
+                        self.set_status("Save project (demo)");
+                    }
+                    ui.separator();
+                    if toolbar_btn(ui, "Undo", "Undo") {
+                        self.set_status("Undo (demo)");
+                    }
+                    if toolbar_btn(ui, "Redo", "Redo") {
+                        self.set_status("Redo (demo)");
+                    }
+                    ui.separator();
+                    if toolbar_btn(ui, "Split", "Split at playhead") {
+                        self.set_status("Split at playhead (demo)");
+                    }
+                    if toolbar_btn(ui, "Del", "Delete selected") {
+                        self.set_status("Delete selected (demo)");
+                    }
+                    ui.separator();
+                    if toolbar_btn(ui, "Z+", "Zoom in timeline") {
+                        self.tl_zoom *= 1.25;
+                    }
+                    if toolbar_btn(ui, "Z-", "Zoom out timeline") {
+                        self.tl_zoom /= 1.25;
+                    }
+
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        ui.label(
+                            egui::RichText::new(&self.status)
+                                .size(11.0)
+                                .color(TEXT_DIM),
+                        )
+                        .on_hover_text("Status");
+                    });
+                });
+            });
+    }
+}
+
+// Free-function toolbar button (no &mut self) so the caller can run an action
+// on self after the call returns, without a self-borrow conflict.
+fn toolbar_btn(ui: &mut Ui, label: &str, tip: &str) -> bool {
+    let btn = egui::Button::new(egui::RichText::new(label).size(12.0))
+        .fill(Color32::TRANSPARENT)
+        .stroke(Stroke::NONE)
+        .min_size(Vec2::new(30.0, 24.0));
+    ui.add(btn).on_hover_text(tip).clicked()
+}
+
+// Small drawn icons (avoid relying on emoji/color-glyph fonts).
+fn draw_magnifier_icon(ui: &mut Ui, color: Color32) {
+    let (r, _) = ui.allocate_exact_size(Vec2::new(16.0, 16.0), Sense::hover());
+    ui.painter().circle_stroke(pos2(r.center().x - 1.0, r.center().y - 1.0), 4.0, Stroke::new(1.4_f32, color));
+    ui.painter().line_segment(
+        [
+            pos2(r.center().x + 2.5, r.center().y + 2.5),
+            pos2(r.right() - 1.0, r.bottom() - 1.0),
+        ],
+        Stroke::new(1.6_f32, color),
+    );
+}
+
+fn draw_folder_icon(ui: &mut Ui) {
+    let (r, _) = ui.allocate_exact_size(Vec2::new(16.0, 13.0), Sense::hover());
+    ui.painter().rect_filled(
+        Rect::from_min_size(pos2(r.min.x, r.min.y + 3.0), Vec2::new(r.width(), r.height() - 3.0)),
+        1.0,
+        Color32::from_rgb(220, 180, 60),
+    );
+    ui.painter().rect_filled(
+        Rect::from_min_size(pos2(r.min.x, r.min.y), Vec2::new(r.width() * 0.45, 4.0)),
+        1.0,
+        Color32::from_rgb(200, 160, 40),
+    );
+}
+
+fn draw_lock_icon(ui: &mut Ui, color: Color32) {
+    let (r, _) = ui.allocate_exact_size(Vec2::new(12.0, 14.0), Sense::hover());
+    ui.painter().circle_stroke(pos2(r.center().x, r.min.y + 4.0), 3.0, Stroke::new(1.2_f32, color));
+    ui.painter().rect_filled(
+        Rect::from_min_size(pos2(r.min.x + 1.0, r.min.y + 4.0), Vec2::new(r.width() - 2.0, 9.0)),
+        1.0,
+        color,
+    );
+}
+
+// ===========================================================================
+// Left dock: tabbed windows (screenshot 1)
+// ===========================================================================
+
+impl VegasApp {
+    fn render_dock(&mut self, ui: &mut Ui) {
+        let rect = ui.max_rect();
+        ui.painter().rect_filled(rect, 0.0, PANEL_DARK);
+
+        // content fills the area above the bottom tab bar
+        let tab_h = 24.0;
+        let content_h = (rect.height() - tab_h).max(0.0);
+        let content_rect = Rect::from_min_size(rect.min, Vec2::new(rect.width(), content_h));
+        ui.allocate_ui_at_rect(content_rect, |ui| {
+            match self.dock_tab {
+                DockTab::VideoFx => self.render_video_fx_dock(ui),
+                DockTab::ProjectMedia => self.render_project_media(ui),
+                DockTab::Explorer => self.render_explorer(ui),
+                DockTab::Transitions => self.render_transitions(ui),
+                DockTab::ProjectNotes => self.render_project_notes(ui),
+            }
+        });
+
+        // bottom tab bar: Project Media | Explorer | Transitions | Video FX | Project Notes
+        let tab_rect = Rect::from_min_size(
+            pos2(rect.min.x, rect.min.y + content_h),
+            Vec2::new(rect.width(), tab_h),
         );
-        if !self.video_export.auto_bitrate {
-            ui.add(
-                egui::Slider::new(&mut self.video_export.video_bitrate_mbps, 1..=200)
-                    .text("Bitrate (Mbps)"),
+        ui.allocate_ui_at_rect(tab_rect, |ui| {
+            self.render_dock_tabs(ui);
+        });
+    }
+
+    fn render_dock_tabs(&mut self, ui: &mut Ui) {
+        ui.painter().rect_filled(ui.max_rect(), 0.0, TAB_INACTIVE);
+        ui.spacing_mut().item_spacing = Vec2::new(0.0, 0.0);
+        ui.horizontal(|ui| {
+            for &t in DockTab::ALL {
+                let active = self.dock_tab == t;
+                let label = t.label();
+                let btn = egui::Button::new(
+                    egui::RichText::new(label)
+                        .size(11.0)
+                        .color(if active { TEXT_WHITE } else { TEXT_DIM }),
+                )
+                .fill(if active { TAB_ACTIVE } else { TAB_INACTIVE })
+                .stroke(Stroke::NONE)
+                .min_size(Vec2::new(84.0, 24.0));
+                let resp = ui.add(btn);
+                // Vegas-style accent line along the top of the active tab
+                if active {
+                    let r = resp.rect;
+                    ui.painter().line_segment(
+                        [pos2(r.left(), r.top() + 1.0), pos2(r.right(), r.top() + 1.0)],
+                        Stroke::new(2.0_f32, ACCENT_BLUE),
+                    );
+                }
+                if resp.clicked() {
+                    self.dock_tab = t;
+                }
+            }
+            // trailing close/minimize glyphs on the active tab (like the ▢ ✕ in shot 1)
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                ui.add_space(6.0);
+                let _ = ui.small_button("✕");
+                let _ = ui.small_button("▢");
+            });
+        });
+    }
+
+    // ---- Video FX dock (screenshot 1) -------------------------------------
+    fn render_video_fx_dock(&mut self, ui: &mut Ui) {
+        let rect = ui.max_rect();
+        let list_w = (rect.width() * 0.42).clamp(140.0, 220.0);
+        let list_rect = Rect::from_min_size(rect.min, Vec2::new(list_w, rect.height()));
+        let preset_rect = Rect::from_min_size(
+            pos2(rect.min.x + list_w, rect.min.y),
+            Vec2::new(rect.width() - list_w, rect.height()),
+        );
+
+        // left: search box + "All" folder + scrollable FX list
+        ui.allocate_ui_at_rect(list_rect, |ui| {
+            ui.spacing_mut().item_spacing = Vec2::new(4.0, 4.0);
+            ui.add_space(4.0);
+            // search field with drawn magnifier (blue accent, like shot 1)
+            ui.horizontal(|ui| {
+                draw_magnifier_icon(ui, ACCENT_BLUE);
+                ui.add_sized(
+                    Vec2::new(ui.available_width(), 20.0),
+                    egui::TextEdit::singleline(&mut self.fx_search)
+                        .hint_text("Search plug-ins")
+                        .font(FontId::proportional(12.0)),
+                );
+            });
+            // "All" folder tree row
+            ui.horizontal(|ui| {
+                ui.checkbox(&mut self.show_all_folder, "");
+                draw_folder_icon(ui);
+                ui.label(egui::RichText::new("All").color(TEXT_LIGHT).size(12.0));
+            });
+            ui.separator();
+
+            let q = self.fx_search.to_lowercase();
+            let filtered: Vec<&str> = BCC_FX_LIST
+                .iter()
+                .copied()
+                .filter(|n| q.is_empty() || n.to_lowercase().contains(&q))
+                .collect();
+
+            egui::ScrollArea::vertical()
+                .show(ui, |ui| {
+                    ui.spacing_mut().item_spacing = Vec2::new(0.0, 0.0);
+                    for fx in &filtered {
+                        let (r_rect, resp) =
+                            ui.allocate_exact_size(Vec2::new(ui.available_width(), 20.0), Sense::click());
+                        let sel = self.selected_fx.as_deref() == Some(*fx);
+                        if sel {
+                            ui.painter().rect_filled(r_rect, 0.0, TAB_ACTIVE);
+                        } else if resp.hovered() {
+                            ui.painter().rect_filled(r_rect, 0.0, Color32::from_rgb(45, 45, 45));
+                        }
+                        // blue FX badge
+                        let badge = Rect::from_min_size(
+                            pos2(r_rect.min.x + 5.0, r_rect.center().y - 7.0),
+                            Vec2::new(26.0, 14.0),
+                        );
+                        ui.painter().rect_filled(badge, 1.0, FX_BLUE);
+                        ui.painter().text(
+                            badge.center(),
+                            egui::Align2::CENTER_CENTER,
+                            "FX",
+                            FontId::proportional(9.0),
+                            TEXT_WHITE,
+                        );
+                        ui.painter().text(
+                            pos2(r_rect.min.x + 36.0, r_rect.center().y),
+                            egui::Align2::LEFT_CENTER,
+                            *fx,
+                            FontId::proportional(12.0),
+                            TEXT_LIGHT,
+                        );
+                        if resp.clicked() {
+                            self.selected_fx = Some((*fx).to_string());
+                        }
+                    }
+                    if filtered.is_empty() {
+                        ui.add_space(6.0);
+                        ui.label(egui::RichText::new("No plug-ins match").color(TEXT_DIM).size(11.0));
+                    }
+                });
+        });
+
+        // right: "Preset:" pane (empty in screenshot 1)
+        ui.allocate_ui_at_rect(preset_rect, |ui| {
+            ui.painter().rect_filled(ui.max_rect(), 0.0, PRESET_BG);
+            ui.add_space(6.0);
+            ui.horizontal(|ui| {
+                ui.label(
+                    egui::RichText::new("Preset:")
+                        .size(12.0)
+                        .color(TEXT_LIGHT)
+                        .strong(),
+                );
+            });
+            ui.add_space(6.0);
+            if let Some(name) = &self.selected_fx {
+                ui.label(egui::RichText::new(format!("Plug-in: {}", name)).color(TEXT_DIM).size(11.0));
+                ui.add_space(6.0);
+                ui.label(
+                    egui::RichText::new("(no preset selected)")
+                        .color(TEXT_DIM)
+                        .size(11.0),
+                );
+                ui.add_space(8.0);
+                if ui.add(egui::Button::new("Add to selected event").small()).clicked() {
+                    self.set_status(format!("Applied {} (demo)", name));
+                }
+            } else {
+                ui.label(
+                    egui::RichText::new("Select a plug-in from the list")
+                        .color(TEXT_DIM)
+                        .size(11.0),
+                );
+            }
+        });
+
+        // vertical splitter between list and preset
+        ui.painter().line_segment(
+            [
+                pos2(list_rect.right(), rect.min.y + 4.0),
+                pos2(list_rect.right(), rect.max.y - 4.0),
+            ],
+            Stroke::new(1.0_f32, Color32::from_rgb(20, 20, 20)),
+        );
+    }
+
+    fn render_project_media(&mut self, ui: &mut Ui) {
+        ui.add_space(4.0);
+        ui.horizontal(|ui| {
+            ui.label(egui::RichText::new("Project Media").strong().color(TEXT_LIGHT));
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if ui.small_button("Import").clicked() {
+                    self.set_status("Import media (demo)");
+                }
+            });
+        });
+        ui.separator();
+        ui.add_space(6.0);
+        ui.vertical_centered(|ui| {
+            draw_folder_icon(ui);
+            ui.add_space(4.0);
+            ui.label(egui::RichText::new("Media bin is empty").color(TEXT_DIM).size(11.0));
+            ui.label(
+                egui::RichText::new("Drop video / audio files here or click Import")
+                    .color(TEXT_DIM)
+                    .size(10.0),
+            );
+        });
+    }
+
+    fn render_explorer(&mut self, ui: &mut Ui) {
+        ui.add_space(4.0);
+        ui.horizontal(|ui| {
+            ui.text_edit_singleline(&mut String::new()).on_hover_text("Path");
+            let _ = ui.small_button("⌃");
+        });
+        ui.separator();
+        egui::ScrollArea::vertical().show(ui, |ui| {
+            for d in &["~/Movies", "~/Music", "~/Pictures", "/Library/OFX/Plugins"] {
+                ui.horizontal(|ui| {
+                    draw_folder_icon(ui);
+                    ui.label(egui::RichText::new(*d).size(11.0).color(TEXT_LIGHT));
+                });
+            }
+        });
+    }
+
+    fn render_transitions(&mut self, ui: &mut Ui) {
+        ui.add_space(4.0);
+        ui.label(egui::RichText::new("Transitions").strong().color(TEXT_LIGHT));
+        ui.separator();
+        egui::ScrollArea::vertical().show(ui, |ui| {
+            for t in &[
+                "Dissolve",
+                "Crossfade",
+                "Wipe",
+                "Slide",
+                "Push",
+                "Dip to Black",
+                "S_DissolveGlow",
+                "S_DissolveLensFlare",
+                "S_FilmRoll",
+                "S_SwishPan",
+            ] {
+                let (r, resp) = ui.allocate_exact_size(Vec2::new(ui.available_width(), 20.0), Sense::click());
+                if resp.hovered() {
+                    ui.painter().rect_filled(r, 0.0, Color32::from_rgb(45, 45, 45));
+                }
+                ui.painter().text(
+                    pos2(r.min.x + 6.0, r.center().y),
+                    egui::Align2::LEFT_CENTER,
+                    *t,
+                    FontId::proportional(12.0),
+                    TEXT_LIGHT,
+                );
+                if resp.clicked() {
+                    self.set_status(format!("Transition: {} (demo)", t));
+                }
+            }
+        });
+    }
+
+    fn render_project_notes(&mut self, ui: &mut Ui) {
+        ui.add_space(4.0);
+        ui.label(egui::RichText::new("Project Notes").strong().color(TEXT_LIGHT));
+        ui.separator();
+        ui.add_space(2.0);
+        egui::ScrollArea::vertical()
+            .show(ui, |ui| {
+                ui.add(
+                    egui::TextEdit::multiline(&mut self.notes)
+                        .desired_width(f32::MAX)
+                        .desired_rows(20)
+                        .font(FontId::proportional(12.0)),
+                );
+            });
+    }
+}
+
+// ===========================================================================
+// Video Preview window (screenshot 2)
+// ===========================================================================
+
+impl VegasApp {
+    fn render_preview(&mut self, ui: &mut Ui) {
+        let rect = ui.max_rect();
+        ui.painter().rect_filled(rect, 0.0, Color32::from_rgb(26, 26, 26));
+
+        // --- preview toolbar (gear, save, fx, copy, dropdown, "Preview (Auto)", grid, ...)
+        let tb_h = 26.0;
+        let tb_rect = Rect::from_min_size(rect.min, Vec2::new(rect.width(), tb_h));
+        ui.painter().rect_filled(tb_rect, 0.0, MENU_BAR);
+        ui.allocate_ui_at_rect(tb_rect, |ui| {
+            ui.add_space(2.0);
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing = Vec2::new(2.0, 0.0);
+                for (g, tip) in &[
+                    ("Set", "Settings"),
+                    ("Save", "Save frame"),
+                    ("FX", "Plug-ins"),
+                    ("Copy", "Copy frame"),
+                    ("Menu", "Menu"),
+                ] {
+                    let btn = egui::Button::new(egui::RichText::new(*g).size(10.0))
+                        .fill(Color32::TRANSPARENT)
+                        .stroke(Stroke::NONE)
+                        .min_size(Vec2::new(26.0, 22.0));
+                    ui.add(btn).on_hover_text(*tip);
+                }
+                ui.separator();
+                // "Preview (Auto)" dropdown
+                egui::ComboBox::from_id_salt("preview_combo")
+                    .selected_text("Preview (Auto)")
+                    .width(120.0)
+                    .show_ui(ui, |ui| {
+                        ui.selectable_value(&mut self.preview_scale, 1.0, "Preview (Full)");
+                        ui.selectable_value(&mut self.preview_scale, 0.5, "Preview (Half)");
+                        ui.selectable_value(&mut self.preview_scale, 0.25, "Preview (Quarter)");
+                    });
+                ui.separator();
+                for (g, tip) in &[
+                    ("Grid", "Grid"),
+                    ("Snap", "Snapshot"),
+                    ("Ref", "Refresh"),
+                    ("Safe", "Safe frames"),
+                ] {
+                    let btn = egui::Button::new(egui::RichText::new(*g).size(10.0))
+                        .fill(Color32::TRANSPARENT)
+                        .stroke(Stroke::NONE)
+                        .min_size(Vec2::new(28.0, 22.0));
+                    ui.add(btn).on_hover_text(*tip);
+                }
+            });
+        });
+
+        // --- black canvas (centered) --------------------------------------
+        let info_h = 56.0;
+        let canvas_rect = Rect::from_min_max(
+            pos2(rect.min.x + 8.0, rect.min.y + tb_h + 6.0),
+            pos2(rect.max.x - 8.0, rect.max.y - info_h - 6.0),
+        );
+        ui.painter().rect_filled(canvas_rect, 0.0, CANVAS_BLACK);
+        ui.painter().rect_stroke(canvas_rect, 0.0, Stroke::new(1.0_f32, Color32::from_rgb(40, 40, 40)));
+
+        // safe-frames + center crosshair so the black canvas reads as a real preview
+        let cx = canvas_rect.center();
+        ui.painter().line_segment(
+            [pos2(cx.x - 8.0, cx.y), pos2(cx.x + 8.0, cx.y)],
+            Stroke::new(1.0_f32, Color32::from_rgb(60, 60, 60)),
+        );
+        ui.painter().line_segment(
+            [pos2(cx.x, cx.y - 8.0), pos2(cx.x, cx.y + 8.0)],
+            Stroke::new(1.0_f32, Color32::from_rgb(60, 60, 60)),
+        );
+        let safe = canvas_rect.shrink2(Vec2::new(canvas_rect.width() * 0.1, canvas_rect.height() * 0.1));
+        ui.painter().rect_stroke(safe, 0.0, Stroke::new(0.5_f32, Color32::from_rgb(50, 50, 50)));
+        ui.painter().text(
+            canvas_rect.center(),
+            egui::Align2::CENTER_CENTER,
+            "Preview",
+            FontId::proportional(22.0),
+            Color32::from_rgb(45, 45, 45),
+        );
+
+        // --- transport row beneath the canvas ------------------------------
+        let trans_h = 28.0;
+        let trans_rect = Rect::from_min_max(
+            pos2(canvas_rect.min.x, canvas_rect.max.y + 4.0),
+            pos2(canvas_rect.max.x, canvas_rect.max.y + 4.0 + trans_h),
+        );
+        ui.allocate_ui_at_rect(trans_rect, |ui| {
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing = Vec2::new(2.0, 0.0);
+                let play_lbl = if self.is_playing { "‖" } else { "▶" };
+                let play_col = if self.is_playing { ACCENT_BLUE } else { TEXT_LIGHT };
+                if ui
+                    .add(
+                        egui::Button::new(egui::RichText::new(play_lbl).size(14.0).color(play_col))
+                            .fill(Color32::TRANSPARENT)
+                            .stroke(Stroke::NONE),
+                    )
+                    .on_hover_text("Play / Pause (Space)")
+                    .clicked()
+                {
+                    self.is_playing = !self.is_playing;
+                }
+                if ui
+                    .add(egui::Button::new(egui::RichText::new("■").size(12.0)).fill(Color32::TRANSPARENT).stroke(Stroke::NONE))
+                    .on_hover_text("Stop")
+                    .clicked()
+                {
+                    self.is_playing = false;
+                    self.playhead_sec = 0.0;
+                }
+                if ui
+                    .add(egui::Button::new(egui::RichText::new("|◀").size(11.0)).fill(Color32::TRANSPARENT).stroke(Stroke::NONE))
+                    .on_hover_text("Go to start")
+                    .clicked()
+                {
+                    self.playhead_sec = 0.0;
+                }
+                ui.separator();
+                ui.label(
+                    egui::RichText::new(format_tc(self.playhead_sec, self.fps))
+                        .monospace()
+                        .size(12.0)
+                        .color(TEXT_LIGHT),
+                );
+            });
+        });
+
+        // --- project info text (orange numeric readouts like shot 2) -------
+        let info_rect = Rect::from_min_max(
+            pos2(rect.min.x + 8.0, rect.max.y - info_h),
+            pos2(rect.max.x - 8.0, rect.max.y),
+        );
+        ui.allocate_ui_at_rect(info_rect, |ui| {
+            ui.add_space(2.0);
+            ui.vertical(|ui| {
+                info_line(
+                    ui,
+                    "Project:",
+                    &format!("{}x{}x32, {:.3}p", self.project_w, self.project_h, self.fps),
+                );
+                info_line(
+                    ui,
+                    "Preview:",
+                    &format!(
+                        "{}x{}x32, {:.3}p",
+                        (self.project_w as f32 * self.preview_scale) as u32,
+                        (self.project_h as f32 * self.preview_scale) as u32,
+                        self.fps
+                    ),
+                );
+                ui.horizontal(|ui| {
+                    ui.label(egui::RichText::new("Frame:").size(10.0).color(TEXT_DIM));
+                    ui.label(egui::RichText::new(format!("{}", self.frame)).size(10.0).color(ORANGE));
+                });
+                let disp_w = (canvas_rect.width().round() as u32).max(1);
+                let disp_h = (canvas_rect.height().round() as u32).max(1);
+                info_line(ui, "Display:", &format!("{}x{}x32", disp_w, disp_h));
+            });
+        });
+    }
+}
+
+fn info_line(ui: &mut Ui, label: &str, value: &str) {
+    ui.horizontal(|ui| {
+        ui.label(egui::RichText::new(label).size(10.0).color(TEXT_DIM));
+        ui.label(egui::RichText::new(value).size(10.0).color(ORANGE));
+    });
+}
+
+// ===========================================================================
+// Master Bus mixer (screenshot 2 right panel)
+// ===========================================================================
+
+impl VegasApp {
+    fn render_master_bus(&mut self, ui: &mut Ui) {
+        let rect = ui.max_rect();
+        ui.painter().rect_filled(rect, 0.0, PANEL_DARK);
+
+        // header row: gear / rewind / speaker / sliders icons
+        let head_h = 64.0;
+        let head_rect = Rect::from_min_size(rect.min, Vec2::new(rect.width(), head_h));
+        ui.allocate_ui_at_rect(head_rect, |ui| {
+            ui.add_space(3.0);
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing = Vec2::new(3.0, 0.0);
+                for (g, tip) in &[("Set", "Bus settings"), ("Rst", "Reset"), ("Mon", "Monitor"), ("Mix", "Mixer")] {
+                    ui.add(
+                        egui::Button::new(egui::RichText::new(*g).size(10.0))
+                            .fill(Color32::TRANSPARENT)
+                            .stroke(Stroke::NONE),
+                    )
+                    .on_hover_text(*tip);
+                }
+            });
+            ui.add_space(2.0);
+            ui.horizontal(|ui| {
+                let mut master_on = true;
+                ui.checkbox(&mut master_on, "").on_hover_text("Master enable");
+                ui.label(egui::RichText::new("Master").size(11.0).color(TEXT_LIGHT));
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    ui.add(egui::Button::new("S").small().fill(RED_REC)).on_hover_text("Solo");
+                });
+            });
+            ui.add_space(2.0);
+            ui.horizontal(|ui| {
+                ui.label(egui::RichText::new("FX").size(11.0).color(TEXT_LIGHT));
+                ui.add_space(6.0);
+                ui.add(egui::Button::new("●").small().fill(RED_REC)).on_hover_text("FX enable");
+                ui.add(egui::Button::new("$").small().fill(ORANGE)).on_hover_text("Bus FX");
+            });
+        });
+
+        // fader + dB meter scale area
+        let meter_rect = Rect::from_min_max(
+            pos2(rect.min.x + 6.0, rect.min.y + head_h + 4.0),
+            pos2(rect.max.x - 6.0, rect.max.y - 34.0),
+        );
+        self.draw_master_fader(ui, meter_rect);
+
+        // bottom readout: padlock + 0.0 / 0.0
+        let foot_rect = Rect::from_min_max(
+            pos2(rect.min.x + 4.0, rect.max.y - 30.0),
+            pos2(rect.max.x - 4.0, rect.max.y - 4.0),
+        );
+        ui.allocate_ui_at_rect(foot_rect, |ui| {
+            ui.horizontal(|ui| {
+                draw_lock_icon(ui, TEXT_DIM);
+                ui.label(
+                    egui::RichText::new(format!("{:>5.1} {:>5.1}", self.master_db, self.master_db))
+                        .monospace()
+                        .size(10.0)
+                        .color(ORANGE),
+                );
+            });
+        });
+
+        // "Master Bus" bottom tab (shot 2)
+        let tab_rect = Rect::from_min_max(
+            pos2(rect.min.x, rect.max.y - 22.0),
+            rect.max,
+        );
+        ui.painter().rect_filled(tab_rect, 0.0, TAB_INACTIVE);
+        let active = Rect::from_min_size(tab_rect.min, Vec2::new(tab_rect.width() * 0.55, 22.0));
+        ui.painter().rect_filled(active, 0.0, TAB_ACTIVE);
+        ui.painter().text(
+            active.center(),
+            egui::Align2::CENTER_CENTER,
+            "Master Bus",
+            FontId::proportional(10.0),
+            TEXT_LIGHT,
+        );
+    }
+
+    fn draw_master_fader(&mut self, ui: &mut Ui, rect: Rect) {
+        ui.painter().rect_filled(rect, 0.0, Color32::from_rgb(24, 24, 24));
+
+        // fader on the left, dB scale + meter on the right
+        let fader_w = 22.0;
+        let fader_rect = Rect::from_min_size(
+            pos2(rect.min.x + 4.0, rect.min.y + 6.0),
+            Vec2::new(fader_w, rect.height() - 12.0),
+        );
+        let meter_rect = Rect::from_min_size(
+            pos2(rect.min.x + fader_w + 6.0, rect.min.y + 6.0),
+            Vec2::new(rect.width() - fader_w - 18.0, rect.height() - 12.0),
+        );
+
+        // fader track + handle (draggable)
+        ui.painter().rect_filled(fader_rect, 2.0, Color32::from_rgb(40, 40, 40));
+        // map master_db (-60..+12) to 0..1
+        let norm = ((self.master_db + 60.0) / 72.0).clamp(0.0, 1.0);
+        let handle_y = fader_rect.bottom() - norm * fader_rect.height();
+        let handle = Rect::from_center_size(pos2(fader_rect.center().x, handle_y), Vec2::new(20.0, 14.0));
+        ui.painter().rect_filled(handle, 2.0, Color32::from_rgb(80, 80, 80));
+        ui.painter().rect_stroke(handle, 2.0, Stroke::new(1.0_f32, Color32::from_rgb(120, 120, 120)));
+        // little twin-square glyph on the handle
+        ui.painter().rect_stroke(
+            Rect::from_center_size(handle.center(), Vec2::new(7.0, 7.0)),
+            1.0,
+            Stroke::new(1.0_f32, TEXT_LIGHT),
+        );
+
+        let resp = ui.interact(handle, egui::Id::new("master_fader"), Sense::drag());
+        if resp.dragged() {
+            let dy = resp.drag_delta().y;
+            let dn = -dy / fader_rect.height();
+            self.master_db = (self.master_db + dn * 72.0).clamp(-60.0, 12.0);
+        }
+
+        // dB scale + colored meter
+        let scale_labels = [3, 6, 9, 12, 15, 18, 21, 24, 27, 30, 36, 42, 48, 54, 60];
+        let n = scale_labels.len();
+        for (i, db) in scale_labels.iter().enumerate() {
+            let frac = i as f32 / (n - 1) as f32;
+            let y = meter_rect.top() + frac * meter_rect.height();
+            ui.painter().line_segment(
+                [pos2(meter_rect.left(), y), pos2(meter_rect.left() + 3.0, y)],
+                Stroke::new(1.0_f32, TEXT_DIM),
+            );
+            ui.painter().text(
+                pos2(meter_rect.right() + 2.0, y),
+                egui::Align2::LEFT_CENTER,
+                format!("-{}", db),
+                FontId::proportional(8.0),
+                TEXT_DIM,
             );
         }
-        egui::ComboBox::from_label("Audio bitrate")
-            .selected_text(format!("{} kbps", self.video_export.audio_bitrate_kbps))
-            .show_ui(ui, |ui| {
-                for br in [128u32, 192, 256, 320, 512] {
-                    ui.selectable_value(
-                        &mut self.video_export.audio_bitrate_kbps,
-                        br,
-                        format!("{} kbps", br),
-                    );
-                }
-            });
-        ui.checkbox(
-            &mut self.video_export.hardware_encode,
-            "macOS VideoToolbox hardware acceleration",
-        );
-        ui.checkbox(
-            &mut self.video_export.also_export_pcm_wav,
-            "Also export a PCM WAV sidecar of the mix",
-        );
 
-        if let Err(err) = validate_video_export(&self.video_export) {
-            ui.colored_label(egui::Color32::from_rgb(255, 180, 70), err);
+        // meter body with green->yellow->red gradient + current level fill
+        let lvl = self.master_level.clamp(0.0, 1.0);
+        let mh = meter_rect.height();
+        let cols = [
+            Color32::from_rgb(40, 200, 80),
+            Color32::from_rgb(120, 200, 40),
+            Color32::from_rgb(220, 190, 30),
+            Color32::from_rgb(230, 120, 30),
+            Color32::from_rgb(220, 50, 40),
+        ];
+        let seg = mh / cols.len() as f32;
+        for (i, c) in cols.iter().enumerate() {
+            let seg_top = meter_rect.top() + i as f32 * seg;
+            let r = Rect::from_min_size(pos2(meter_rect.left(), seg_top), Vec2::new(meter_rect.width(), seg));
+            // darken unlit portion
+            ui.painter().rect_filled(r, 0.0, Color32::from_rgb(28, 28, 28));
+            // lit portion (from bottom up) up to lvl
+            let lit_h = ((lvl * mh) - i as f32 * seg).clamp(0.0, seg);
+            if lit_h > 0.0 {
+                ui.painter().rect_filled(
+                    Rect::from_min_size(pos2(r.left(), r.bottom() - lit_h), Vec2::new(r.width(), lit_h)),
+                    0.0,
+                    *c,
+                );
+            }
         }
-
-        ui.add_space(10.0);
-        let btn_lbl = format!(
-            "Export {} · {} · {} fps",
-            self.video_export.container.ext().to_uppercase(),
-            self.video_export.resolution.label(),
-            self.video_export.fps
-        );
-        let exp_btn = egui::Button::new(
-            egui::RichText::new(btn_lbl)
-                .strong()
-                .color(egui::Color32::from_rgb(6, 32, 29)),
-        )
-        .fill(egui::Color32::from_rgb(45, 212, 191))
-        .min_size(egui::vec2(ui.available_width(), 38.0));
-
-        if ui.add(exp_btn).clicked() {
-            self.trigger_video_export();
-        }
+        ui.painter().rect_stroke(meter_rect, 1.0, Stroke::new(1.0_f32, Color32::from_rgb(20, 20, 20)));
     }
 }
 
-fn main() -> eframe::Result<()> {
-    let args: Vec<String> = std::env::args().collect();
-    if args.len() > 1 && (args[1] == "--elastique" || args[1] == "elastique" || args[1] == "-h" || args[1] == "--help") {
-        let cli_args: Vec<String> = if args[1] == "--elastique" || args[1] == "elastique" {
-            std::iter::once(args[0].clone()).chain(args[2..].iter().cloned()).collect()
-        } else {
-            args
-        };
-        let code = elastique_cli::run_elastique_cli(&cli_args);
-        std::process::exit(code);
+// ===========================================================================
+// Timeline (screenshot 3)
+// ===========================================================================
+
+impl VegasApp {
+    fn render_timeline(&mut self, ctx: &egui::Context) {
+        egui::TopBottomPanel::bottom("vegas_timeline")
+            .min_height(330.0)
+            .default_height(380.0)
+            .resizable(true)
+            .show(ctx, |ui| {
+                let rect = ui.max_rect();
+                ui.painter().rect_filled(rect, 0.0, Color32::from_rgb(28, 28, 28));
+
+                let header_w = 200.0;
+                let ruler_h = 26.0;
+                let left_rect = Rect::from_min_size(rect.min, Vec2::new(header_w, rect.height()));
+                let right_rect = Rect::from_min_size(
+                    pos2(rect.min.x + header_w, rect.min.y),
+                    Vec2::new(rect.width() - header_w, rect.height()),
+                );
+
+                // ---- left column: big timecode + "Rate: 1.00" + track headers
+                ui.allocate_ui_at_rect(left_rect, |ui| {
+                    self.render_timeline_left(ui, ruler_h);
+                });
+
+                // ---- right column: ruler + tracks + playhead overlay
+                ui.allocate_ui_at_rect(right_rect, |ui| {
+                    let panel = ui.max_rect();
+                    let ruler_rect = Rect::from_min_size(panel.min, Vec2::new(panel.width(), ruler_h));
+                    let tracks_rect = Rect::from_min_max(
+                        pos2(panel.min.x, panel.min.y + ruler_h),
+                        panel.max,
+                    );
+
+                    // ruler
+                    ui.allocate_ui_at_rect(ruler_rect, |ui| {
+                        self.draw_ruler(ui, ruler_rect);
+                    });
+
+                    // tracks
+                    ui.allocate_ui_at_rect(tracks_rect, |ui| {
+                        self.draw_tracks(ui, tracks_rect);
+                    });
+
+                    // loop region strip (thin yellow band at top of tracks)
+                    let lx = tracks_rect.left() + (self.loop_start as f32) * self.tl_zoom;
+                    let rx = tracks_rect.left() + (self.loop_end as f32) * self.tl_zoom;
+                    ui.painter().rect_filled(
+                        Rect::from_min_max(
+                            pos2(lx, ruler_rect.top()),
+                            pos2(rx, ruler_rect.top() + 4.0),
+                        ),
+                        0.0,
+                        loop_region_color(),
+                    );
+
+                    // playhead overlay (spans ruler + tracks)
+                    let px = tracks_rect.left() + (self.playhead_sec as f32) * self.tl_zoom;
+                    if px >= tracks_rect.left() && px <= tracks_rect.right() {
+                        ui.painter().line_segment(
+                            [pos2(px, ruler_rect.top() + 2.0), pos2(px, tracks_rect.bottom())],
+                            Stroke::new(1.5_f32, PLAYHEAD),
+                        );
+                        // playhead triangle at the ruler top
+                        let tri = [
+                            pos2(px - 4.0, ruler_rect.top() + 1.0),
+                            pos2(px + 4.0, ruler_rect.top() + 1.0),
+                            pos2(px, ruler_rect.top() + 6.0),
+                        ];
+                        ui.painter().add(egui::Shape::convex_polygon(
+                            tri.to_vec(),
+                            PLAYHEAD,
+                            Stroke::NONE,
+                        ));
+                    }
+
+                    // "P" preferences icon, top-right of the timeline
+                    let p_icon = Rect::from_min_size(
+                        pos2(panel.right() - 18.0, panel.top() + 4.0),
+                        Vec2::new(14.0, 14.0),
+                    );
+                    let p_resp = ui.interact(p_icon, egui::Id::new("tl_prefs"), Sense::click());
+                    ui.painter().text(
+                        p_icon.center(),
+                        egui::Align2::CENTER_CENTER,
+                        "P",
+                        FontId::proportional(11.0),
+                        if p_resp.hovered() { TEXT_WHITE } else { TEXT_DIM },
+                    );
+                    if p_resp.clicked() {
+                        self.set_status("Timeline preferences (demo)");
+                    }
+                });
+
+                // splitter between headers and tracks
+                ui.painter().line_segment(
+                    [
+                        pos2(rect.min.x + header_w, rect.min.y),
+                        pos2(rect.min.x + header_w, rect.max.y),
+                    ],
+                    Stroke::new(1.0_f32, Color32::from_rgb(18, 18, 18)),
+                );
+            });
     }
 
-    let options = eframe::NativeOptions {
+    fn render_timeline_left(&mut self, ui: &mut Ui, ruler_h: f32) {
+        let rect = ui.max_rect();
+
+        // big timecode display box (top-left, spans the ruler row)
+        let tc_rect = Rect::from_min_size(rect.min, Vec2::new(rect.width(), ruler_h));
+        ui.painter().rect_filled(tc_rect, 0.0, Color32::from_rgb(20, 20, 20));
+        ui.painter().text(
+            pos2(tc_rect.min.x + 8.0, tc_rect.center().y),
+            egui::Align2::LEFT_CENTER,
+            format_tc(self.playhead_sec, self.fps),
+            FontId::monospace(18.0),
+            TEXT_WHITE,
+        );
+        // "Rate: 1.00" box just under the timecode (bottom-left of left col)
+        let rate_rect = Rect::from_min_size(
+            pos2(rect.min.x + 4.0, rect.max.y - 16.0),
+            Vec2::new(70.0, 12.0),
+        );
+        ui.painter().rect_filled(rate_rect, 1.0, Color32::from_rgb(40, 40, 40));
+        ui.painter().text(
+            rate_rect.center(),
+            egui::Align2::CENTER_CENTER,
+            "Rate: 1.00",
+            FontId::proportional(9.0),
+            TEXT_DIM,
+        );
+
+        // track headers (aligned with the tracks which start below the ruler)
+        let headers_rect = Rect::from_min_max(
+            pos2(rect.min.x, rect.min.y + ruler_h),
+            pos2(rect.max.x, rect.max.y),
+        );
+        // Snapshot the tracks so we can call &mut self methods inside the loop
+        // (self.draw_track_header) without holding an immutable borrow of self.tracks.
+        let tracks: Vec<Track> = self.tracks.clone();
+        ui.allocate_ui_at_rect(headers_rect, |ui| {
+            let mut y = headers_rect.min.y;
+            for (idx, track) in tracks.iter().enumerate() {
+                let h_rect = Rect::from_min_size(
+                    pos2(headers_rect.min.x, y),
+                    Vec2::new(headers_rect.width(), track.height),
+                );
+                self.draw_track_header(ui, h_rect, idx, track.clone());
+                y += track.height;
+            }
+        });
+    }
+
+    fn draw_track_header(&mut self, ui: &mut Ui, rect: Rect, idx: usize, track: Track) {
+        let sel = self.selected_track == Some(idx);
+        ui.painter().rect_filled(rect, 0.0, if sel { Color32::from_rgb(45, 45, 45) } else { Color32::from_rgb(33, 33, 33) });
+        // top accent strip in the track's own color
+        ui.painter().rect_filled(
+            Rect::from_min_size(rect.min, Vec2::new(rect.width(), 3.0)),
+            0.0,
+            track.bg,
+        );
+
+        // row 1: track number + menu + mute/solo/fx
+        let row1 = Rect::from_min_size(pos2(rect.min.x + 4.0, rect.min.y + 4.0), Vec2::new(rect.width() - 8.0, 16.0));
+        ui.allocate_ui_at_rect(row1, |ui| {
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing = Vec2::new(4.0, 0.0);
+                ui.label(egui::RichText::new(format!("{}", idx + 1)).size(11.0).color(TEXT_DIM));
+                // track kind tag (uses Track.kind): "V" video / "A" audio
+                ui.label(
+                    egui::RichText::new(if track.kind == TrackKind::Video { "V" } else { "A" })
+                        .size(9.0)
+                        .color(if track.kind == TrackKind::Video { ACCENT_BLUE } else { ORANGE }),
+                );
+                let m_btn = egui::Button::new(egui::RichText::new("M").size(10.0))
+                    .fill(if track.muted { RED_REC } else { Color32::TRANSPARENT })
+                    .stroke(Stroke::new(0.5_f32, TEXT_DIM))
+                    .min_size(Vec2::new(16.0, 14.0));
+                if ui.add(m_btn).clicked() {
+                    if let Some(t) = self.tracks.get_mut(idx) {
+                        t.muted = !t.muted;
+                    }
+                }
+                let s_btn = egui::Button::new(egui::RichText::new("S").size(10.0))
+                    .fill(Color32::TRANSPARENT)
+                    .stroke(Stroke::new(0.5_f32, TEXT_DIM))
+                    .min_size(Vec2::new(16.0, 14.0));
+                if ui.add(s_btn).clicked() {
+                    if let Some(t) = self.tracks.get_mut(idx) {
+                        t.solo = !t.solo;
+                    }
+                }
+                let f_btn = egui::Button::new(egui::RichText::new("FX").size(9.0))
+                    .fill(Color32::TRANSPARENT)
+                    .stroke(Stroke::new(0.5_f32, TEXT_DIM))
+                    .min_size(Vec2::new(18.0, 14.0));
+                if ui.add(f_btn).clicked() {
+                    self.set_status(format!("Track FX: {} (demo)", track.name));
+                }
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    let _ = ui.small_button("≡");
+                });
+            });
+        });
+
+        // row 2: volume dB + pan + VU meter
+        let row2 = Rect::from_min_max(
+            pos2(rect.min.x + 4.0, row1.bottom() + 2.0),
+            pos2(rect.max.x - 4.0, rect.max.y - 4.0),
+        );
+        ui.allocate_ui_at_rect(row2, |ui| {
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing = Vec2::new(3.0, 0.0);
+                ui.label(
+                    egui::RichText::new(format!(
+                        "{:>5.1} dB",
+                        track.volume_db
+                    ))
+                    .monospace()
+                    .size(10.0)
+                    .color(TEXT_LIGHT),
+                );
+                // pan readout: "Center" at 0, otherwise L/R with offset (uses track.pan)
+                let pan_lbl = if track.pan.abs() < 0.01 {
+                    "Center".to_string()
+                } else if track.pan < 0.0 {
+                    format!("L{:.0}", track.pan.abs() * 100.0)
+                } else {
+                    format!("R{:.0}", track.pan * 100.0)
+                };
+                ui.label(egui::RichText::new(pan_lbl).size(9.0).color(TEXT_DIM));
+            });
+            ui.add_space(1.0);
+            // mini VU meter
+            let vu = Rect::from_min_size(
+                pos2(row2.min.x, row2.min.y + 18.0),
+                Vec2::new(row2.width(), 8.0),
+            );
+            ui.painter().rect_filled(vu, 0.0, Color32::from_rgb(22, 22, 22));
+            let lvl: f32 = if self.is_playing && !track.muted {
+                0.4 + 0.5 * (self.playhead_sec as f32 * 8.0 + idx as f32).sin().abs()
+            } else {
+                0.0
+            };
+            let lw = lvl * vu.width();
+            let col = if lvl > 0.85 {
+                RED_REC
+            } else if lvl > 0.6 {
+                ORANGE
+            } else {
+                Color32::from_rgb(70, 200, 90)
+            };
+            ui.painter().rect_filled(
+                Rect::from_min_size(vu.min, Vec2::new(lw, vu.height())),
+                0.0,
+                col,
+            );
+            ui.painter().rect_stroke(vu, 0.0, Stroke::new(0.5_f32, Color32::from_rgb(20, 20, 20)));
+        });
+
+        // click the header to select the track
+        let resp = ui.interact(rect, egui::Id::new(("track_hdr", idx)), Sense::click());
+        if resp.clicked() {
+            self.selected_track = Some(idx);
+        }
+    }
+
+    fn draw_ruler(&mut self, ui: &mut Ui, rect: Rect) {
+        ui.painter().rect_filled(rect, 0.0, RULER_BG);
+        // major tick every 0.2s (= 12 frames at 60fps), label every 1.0s
+        let step = 0.2_f64;
+        let mut t = 0.0;
+        let max_t = (rect.width() / self.tl_zoom) as f64 + step;
+        while t <= max_t {
+            let x = rect.left() + (t as f32) * self.tl_zoom;
+            if x > rect.right() {
+                break;
+            }
+            let major = (t * 10.0).round() as i64 % 5 == 0;
+            ui.painter().line_segment(
+                [pos2(x, rect.top() + 4.0), pos2(x, rect.bottom())],
+                Stroke::new(if major { 1.0 } else { 0.5_f32 }, Color32::from_rgb(90, 90, 90)),
+            );
+            if major {
+                // compact M:SS label at the top of each integer-second tick
+                let secs = t as i64;
+                let lbl = format!("{}:{:02}", secs / 60, secs % 60);
+                ui.painter().text(
+                    pos2(x + 3.0, rect.top() + 2.0),
+                    egui::Align2::LEFT_TOP,
+                    lbl,
+                    FontId::monospace(9.0),
+                    TEXT_DIM,
+                );
+            }
+            t += step;
+        }
+        ui.painter().line_segment(
+            [rect.left_bottom(), rect.right_bottom()],
+            Stroke::new(1.0_f32, Color32::from_rgb(20, 20, 20)),
+        );
+
+        // click/drag on the ruler scrubs the playhead
+        let resp = ui.interact(rect, egui::Id::new("tl_ruler"), Sense::click_and_drag());
+        if resp.dragged() || resp.clicked() {
+            if let Some(pos) = resp.interact_pointer_pos() {
+                let t = ((pos.x - rect.left()) / self.tl_zoom).max(0.0) as f64;
+                self.playhead_sec = t.min(self.total_dur());
+                self.is_playing = false;
+            }
+        }
+    }
+
+    fn draw_tracks(&mut self, ui: &mut Ui, rect: Rect) {
+        ui.painter().rect_filled(rect, 0.0, Color32::from_rgb(22, 22, 22));
+
+        // Snapshot so self can be mutated during interaction without holding
+        // an immutable borrow of self.tracks across the loop body.
+        let tracks: Vec<Track> = self.tracks.clone();
+        let mut y = rect.min.y;
+        for (idx, track) in tracks.iter().enumerate() {
+            let t_rect = Rect::from_min_size(pos2(rect.min.x, y), Vec2::new(rect.width(), track.height));
+            // track background
+            ui.painter().rect_filled(t_rect, 0.0, track.bg);
+            // subtle grid every 0.2s
+            let mut gx = rect.left();
+            while gx <= rect.right() {
+                ui.painter().line_segment(
+                    [pos2(gx, t_rect.top()), pos2(gx, t_rect.bottom())],
+                    Stroke::new(0.5_f32, GRID_LINE),
+                );
+                gx += 0.2 * self.tl_zoom;
+            }
+
+            // events on this track
+            for ev in &track.events {
+                let ex = t_rect.left() + (ev.start_sec as f32) * self.tl_zoom;
+                let ew = (ev.dur_sec as f32) * self.tl_zoom;
+                if ex + ew < t_rect.left() || ex > t_rect.right() {
+                    continue;
+                }
+                let ev_rect = Rect::from_min_size(
+                    pos2(ex, t_rect.top() + 4.0),
+                    Vec2::new(ew.max(8.0), t_rect.height() - 8.0),
+                );
+                // body
+                ui.painter().rect_filled(ev_rect, 1.0, ev.color);
+                // header strip
+                let hdr = Rect::from_min_size(ev_rect.min, Vec2::new(ev_rect.width(), 12.0));
+                ui.painter().rect_filled(hdr, 1.0, ev.header);
+                ui.painter().text(
+                    pos2(hdr.min.x + 4.0, hdr.center().y),
+                    egui::Align2::LEFT_CENTER,
+                    &ev.name,
+                    FontId::proportional(10.0),
+                    TEXT_WHITE,
+                );
+                // duration on the right of the header
+                ui.painter().text(
+                    pos2(hdr.max.x - 4.0, hdr.center().y),
+                    egui::Align2::RIGHT_CENTER,
+                    format_tc(ev.dur_sec, self.fps),
+                    FontId::monospace(8.0),
+                    Color32::from_rgb(230, 230, 230),
+                );
+
+                if ev.waveform {
+                    // audio waveform inside the body
+                    self.draw_waveform(ui, ev_rect, ev.color);
+                    if let Some(g) = ev.gain {
+                        let gbox = Rect::from_min_size(
+                            pos2(ev_rect.center().x - 22.0, ev_rect.bottom() - 14.0),
+                            Vec2::new(44.0, 12.0),
+                        );
+                        ui.painter().rect_filled(gbox, 1.0, Color32::from_rgba_unmultiplied(0, 0, 0, 160));
+                        ui.painter().text(
+                            gbox.center(),
+                            egui::Align2::CENTER_CENTER,
+                            format!("+{:.3}", g),
+                            FontId::monospace(9.0),
+                            ORANGE,
+                        );
+                    }
+                } else {
+                    // video event: faux thumbnail strip
+                    let mut tx = ev_rect.left() + 2.0;
+                    let th = ev_rect.height() - 16.0;
+                    let mut i = 0;
+                    while tx + 18.0 < ev_rect.right() - 2.0 {
+                        let c = if i % 2 == 0 {
+                            Color32::from_rgb(70, 80, 100)
+                        } else {
+                            Color32::from_rgb(90, 100, 120)
+                        };
+                        ui.painter().rect_filled(
+                            Rect::from_min_size(pos2(tx, ev_rect.top() + 14.0), Vec2::new(16.0, th)),
+                            1.0,
+                            c,
+                        );
+                        tx += 18.0;
+                        i += 1;
+                    }
+                }
+
+                // "87.5%" bottom-right badge like shot 3
+                ui.painter().text(
+                    pos2(ev_rect.right() - 3.0, ev_rect.bottom() - 1.0),
+                    egui::Align2::RIGHT_BOTTOM,
+                    "87.5%",
+                    FontId::monospace(7.0),
+                    Color32::from_rgb(220, 220, 220),
+                );
+
+                // selection outline on the currently selected track's events
+                if self.selected_track == Some(idx) {
+                    ui.painter().rect_stroke(ev_rect, 1.0, Stroke::new(1.0_f32, PLAYHEAD));
+                }
+            }
+
+            // separator between tracks
+            ui.painter().line_segment(
+                [t_rect.left_bottom(), t_rect.right_bottom()],
+                Stroke::new(1.0_f32, Color32::from_rgb(18, 18, 18)),
+            );
+
+            // click on empty track area to move playhead
+            let resp = ui.interact(
+                Rect::from_min_size(pos2(rect.min.x, y), Vec2::new(rect.width(), track.height)),
+                egui::Id::new(("tl_track", idx)),
+                Sense::click_and_drag(),
+            );
+            if resp.dragged() || resp.clicked() {
+                if let Some(pos) = resp.interact_pointer_pos() {
+                    let t = ((pos.x - rect.left()) / self.tl_zoom).max(0.0) as f64;
+                    self.playhead_sec = t.min(self.total_dur());
+                    self.is_playing = false;
+                    self.selected_track = Some(idx);
+                }
+            }
+
+            y += track.height;
+        }
+    }
+
+    fn draw_waveform(&self, ui: &mut Ui, rect: Rect, base: Color32) {
+        let mid = rect.center().y;
+        let h = (rect.height() * 0.42).max(2.0);
+        let stroke = Stroke::new(1.0_f32, Color32::from_rgb(240, 235, 170));
+        let mut pts_top = Vec::new();
+        let mut pts_bot = Vec::new();
+        let step = 2.0_f32;
+        let mut x = rect.left() + 1.0;
+        let mut i = 0_u32;
+        while x < rect.right() - 1.0 {
+            // deterministic pseudo-waveform
+            let s = (i as f32).sin() * 0.5
+                + ((i as f32) * 2.3 + 1.7).sin() * 0.3
+                + ((i as f32) * 5.1).sin() * 0.18;
+            let amp = (s.abs() * h).min(h);
+            pts_top.push(pos2(x, mid - amp));
+            pts_bot.push(pos2(x, mid + amp));
+            x += step;
+            i += 3;
+        }
+        if pts_top.len() > 1 {
+            ui.painter().add(egui::Shape::line(pts_top, stroke));
+            ui.painter().add(egui::Shape::line(pts_bot, stroke));
+        }
+        // tint the base color a touch under the waveform
+        let _ = base;
+    }
+}
+
+// ===========================================================================
+// Transport bar (screenshot 3 bottom strip)
+// ===========================================================================
+
+impl VegasApp {
+    fn render_transport_bar(&mut self, ctx: &egui::Context) {
+        egui::TopBottomPanel::bottom("vegas_transport")
+            .exact_height(34.0)
+            .show(ctx, |ui| {
+                ui.painter().rect_filled(ui.max_rect(), 0.0, MENU_BAR);
+                ui.spacing_mut().item_spacing = Vec2::new(1.0, 0.0);
+                ui.add_space(2.0);
+                ui.horizontal(|ui| {
+                    // loop toggle
+                    ui.add(
+                        egui::Button::new(egui::RichText::new("Loop").size(10.0))
+                            .fill(Color32::TRANSPARENT)
+                            .stroke(Stroke::NONE),
+                    )
+                    .on_hover_text("Loop");
+
+                    // play (blue when playing)
+                    let play_col = if self.is_playing { ACCENT_BLUE } else { TEXT_LIGHT };
+                    if ui
+                        .add(
+                            egui::Button::new(egui::RichText::new("▶").size(14.0).color(play_col))
+                                .fill(if self.is_playing { Color32::from_rgba_unmultiplied(26, 111, 212, 60) } else { Color32::TRANSPARENT })
+                                .stroke(Stroke::NONE),
+                        )
+                        .on_hover_text("Play / Pause (Space)")
+                        .clicked()
+                    {
+                        self.is_playing = !self.is_playing;
+                    }
+                    ui.add(
+                        egui::Button::new(egui::RichText::new("‖").size(12.0))
+                            .fill(Color32::TRANSPARENT)
+                            .stroke(Stroke::NONE),
+                    )
+                    .on_hover_text("Pause");
+                    if ui
+                        .add(
+                            egui::Button::new(egui::RichText::new("■").size(11.0))
+                                .fill(Color32::TRANSPARENT)
+                                .stroke(Stroke::NONE),
+                        )
+                        .on_hover_text("Stop")
+                        .clicked()
+                    {
+                        self.is_playing = false;
+                        self.playhead_sec = 0.0;
+                    }
+                    ui.separator();
+                    for (g, tip) in &[
+                        ("|◀", "Go to start"),
+                        ("◀◀", "Rewind"),
+                        ("▶▶", "Fast forward"),
+                        ("▶|", "Go to end"),
+                    ] {
+                        if ui
+                            .add(
+                                egui::Button::new(egui::RichText::new(*g).size(11.0))
+                                    .fill(Color32::TRANSPARENT)
+                                    .stroke(Stroke::NONE),
+                            )
+                            .on_hover_text(*tip)
+                            .clicked()
+                        {
+                            match *tip {
+                                "Go to start" => self.playhead_sec = 0.0,
+                                "Go to end" => self.playhead_sec = self.total_dur(),
+                                _ => {}
+                            }
+                        }
+                    }
+                    ui.separator();
+                    // record (red, blue ring when armed)
+                    if ui
+                        .add(
+                            egui::Button::new(egui::RichText::new("●").size(13.0).color(RED_REC))
+                                .fill(Color32::TRANSPARENT)
+                                .stroke(Stroke::new(1.0_f32, ACCENT_BLUE)),
+                        )
+                        .on_hover_text("Record")
+                        .clicked()
+                    {
+                        self.set_status("Record (demo)");
+                    }
+                    ui.separator();
+                    for (g, tip) in &[
+                        ("S", "Solo"),
+                        ("Lp", "Loop region"),
+                        ("Snap", "Snap"),
+                        ("Qt", "Quantize"),
+                        ("Split", "Split"),
+                        ("Del", "Delete"),
+                        ("Lk", "Lock"),
+                    ] {
+                        // Snap is a real toggle (reads/writes self.snap); the rest are demo.
+                        let active = *g == "Snap" && self.snap;
+                        let clicked = ui
+                            .add(
+                                egui::Button::new(egui::RichText::new(*g).size(10.0))
+                                    .fill(if active { FX_BLUE } else { Color32::TRANSPARENT })
+                                    .stroke(Stroke::NONE),
+                            )
+                            .on_hover_text(*tip)
+                            .clicked();
+                        if clicked && *g == "Snap" {
+                            self.snap = !self.snap;
+                        }
+                    }
+                    ui.separator();
+                    // zoom +/-
+                    if ui.small_button("+").clicked() {
+                        self.tl_zoom *= 1.25;
+                    }
+                    if ui.small_button("–").clicked() {
+                        self.tl_zoom /= 1.25;
+                    }
+
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        ui.label(
+                            egui::RichText::new(format_tc(self.total_dur(), self.fps))
+                                .monospace()
+                                .size(11.0)
+                                .color(TEXT_DIM),
+                        );
+                        ui.label(egui::RichText::new("/").size(11.0).color(TEXT_DIM));
+                        ui.label(
+                            egui::RichText::new(format_tc(self.playhead_sec, self.fps))
+                                .monospace()
+                                .size(11.0)
+                                .color(ORANGE),
+                        );
+                    });
+                });
+            });
+    }
+}
+
+// ===========================================================================
+// Helpers
+// ===========================================================================
+
+/// Vegas-style timecode "HH:MM:SS.ff" where ff is the frame within the second.
+fn format_tc(sec: f64, fps: f32) -> String {
+    let fps = fps.max(1.0) as u64;
+    let total_frames = (sec * fps as f64).round() as u64;
+    let frames = total_frames % fps;
+    let total_secs = total_frames / fps;
+    let s = total_secs % 60;
+    let m = (total_secs / 60) % 60;
+    let h = (total_secs / 3600) % 100;
+    format!("{:02}:{:02}:{:02}.{:02}", h, m, s, frames)
+}
+
+// ===========================================================================
+// main
+// ===========================================================================
+
+fn main() -> eframe::Result<()> {
+    let opts = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_title("Grain — Pure Rust Video & Audio Studio + OpenFX")
-            .with_inner_size([1440.0, 900.0])
-            .with_min_inner_size([1024.0, 680.0]),
+            .with_inner_size(egui::vec2(1400.0, 900.0))
+            .with_min_inner_size(egui::vec2(900.0, 600.0))
+            .with_title("VEGAS Pro 17.0 — Rust UI Reference"),
         ..Default::default()
     };
-
     eframe::run_native(
-        "Grain",
-        options,
-        Box::new(|_cc| Ok(Box::new(GrainStudioApp::default()))),
+        "Vegas Pro 17 UI Reference",
+        opts,
+        Box::new(|_cc| Ok(Box::new(VegasApp::default()))),
     )
 }

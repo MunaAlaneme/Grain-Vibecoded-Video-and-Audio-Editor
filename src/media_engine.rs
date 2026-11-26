@@ -391,6 +391,7 @@ pub enum TransitionType {
     SFilmRoll,
     SSwishPan,
     SHyperPull,
+    OpenFxCustom,
 }
 
 impl TransitionType {
@@ -406,6 +407,7 @@ impl TransitionType {
         TransitionType::SFilmRoll,
         TransitionType::SSwishPan,
         TransitionType::SHyperPull,
+        TransitionType::OpenFxCustom,
     ];
 
     pub fn label(&self) -> &'static str {
@@ -421,6 +423,7 @@ impl TransitionType {
             TransitionType::SFilmRoll => "SFilmRoll (Sapphire)",
             TransitionType::SSwishPan => "SSwishPan (Sapphire)",
             TransitionType::SHyperPull => "SHyperPull (Sapphire)",
+            TransitionType::OpenFxCustom => "OpenFX Transition (Third Party)",
         }
     }
 }
@@ -454,6 +457,8 @@ impl MaskType {
 #[derive(Debug, Clone)]
 pub struct TextOverlayItem {
     pub text: String,
+    pub style_name: String,
+    pub anim_name: String,
     pub size_pct: f32,
     pub x_pct: f32,
     pub y_pct: f32,
@@ -504,6 +509,7 @@ pub struct VideoFxParams {
     // Transitions
     pub transition: TransitionType,
     pub transition_dur: f32,
+    pub ofx_transition_id: String,
     // Core Effects
     pub blur_px: f32,
     pub vignette: f32,
@@ -663,6 +669,7 @@ impl Default for VideoFxParams {
             hsl_lum_shift: 0.0,
             transition: TransitionType::None,
             transition_dur: 0.8,
+            ofx_transition_id: String::new(),
             blur_px: 0.0,
             vignette: 0.0,
             film_grain: 0.0,
@@ -1285,59 +1292,124 @@ pub fn process_and_export_audio(
 pub struct EffectKeyframe {
     pub time_sec: f64,
     pub easing: EasingCurve,
+    pub property: String,
     pub params: VideoFxParams,
 }
 
+#[inline]
+fn lerpf(a: f32, b: f32, t: f32) -> f32 {
+    a + (b - a) * t
+}
+
 pub fn evaluate_keyframed_params(keyframes: &[EffectKeyframe], current_time: f64) -> VideoFxParams {
+    evaluate_keyframed_params_with_base(keyframes, current_time, &VideoFxParams::default())
+}
+
+pub fn evaluate_keyframed_params_with_base(
+    keyframes: &[EffectKeyframe],
+    current_time: f64,
+    base_fx: &VideoFxParams,
+) -> VideoFxParams {
     if keyframes.is_empty() {
-        return VideoFxParams::default();
-    }
-    if current_time <= keyframes[0].time_sec {
-        return keyframes[0].params.clone();
-    }
-    if current_time >= keyframes[keyframes.len() - 1].time_sec {
-        return keyframes[keyframes.len() - 1].params.clone();
+        return base_fx.clone();
     }
 
-    let mut idx = 0;
-    for i in 0..keyframes.len() - 1 {
-        if current_time >= keyframes[i].time_sec && current_time <= keyframes[i + 1].time_sec {
-            idx = i;
-            break;
+    // Helper to evaluate a single f32 property track (matching either `prop` or "All Properties")
+    let eval_prop = |prop: &str, default_val: f32, getter: fn(&VideoFxParams) -> f32| -> f32 {
+        let mut track: Vec<&EffectKeyframe> = keyframes
+            .iter()
+            .filter(|k| k.property == prop || k.property == "All Properties")
+            .collect();
+        if track.is_empty() {
+            return default_val;
         }
+        track.sort_by(|a, b| a.time_sec.partial_cmp(&b.time_sec).unwrap_or(std::cmp::Ordering::Equal));
+        if current_time <= track[0].time_sec {
+            return getter(&track[0].params);
+        }
+        if current_time >= track[track.len() - 1].time_sec {
+            return getter(&track[track.len() - 1].params);
+        }
+        for i in 0..track.len() - 1 {
+            if current_time >= track[i].time_sec && current_time <= track[i + 1].time_sec {
+                let dt = track[i + 1].time_sec - track[i].time_sec;
+                if dt <= 0.0001 {
+                    return getter(&track[i].params);
+                }
+                let raw_t = ((current_time - track[i].time_sec) / dt) as f32;
+                let t = track[i].easing.eval(raw_t);
+                return lerpf(getter(&track[i].params), getter(&track[i + 1].params), t);
+            }
+        }
+        default_val
+    };
+
+    let mut out = base_fx.clone();
+    // Apply discrete state from nearest keyframe if "All Properties" exists
+    if let Some(nearest) = keyframes.iter().rev().find(|k| k.time_sec <= current_time) {
+        out.look = nearest.params.look;
+        out.wavesenabled = nearest.params.wavesenabled;
+        out.perspectiveenabled = nearest.params.perspectiveenabled;
+        out.crtenabled = nearest.params.crtenabled;
+        out.flip_h = nearest.params.flip_h;
+        out.flip_v = nearest.params.flip_v;
     }
 
-    let k0 = &keyframes[idx];
-    let k1 = &keyframes[idx + 1];
+    out.brightness = eval_prop("brightness", base_fx.brightness, |p| p.brightness);
+    out.contrast = eval_prop("contrast", base_fx.contrast, |p| p.contrast);
+    out.saturation = eval_prop("saturation", base_fx.saturation, |p| p.saturation);
+    out.hue_deg = eval_prop("hue_deg", base_fx.hue_deg, |p| p.hue_deg);
+    out.temperature = eval_prop("temperature", base_fx.temperature, |p| p.temperature);
+    out.tint = eval_prop("tint", base_fx.tint, |p| p.tint);
+    out.blur_px = eval_prop("blur_px", base_fx.blur_px, |p| p.blur_px);
+    out.vignette = eval_prop("vignette", base_fx.vignette, |p| p.vignette);
+    out.film_grain = eval_prop("film_grain", base_fx.film_grain, |p| p.film_grain);
+    out.scanlines = eval_prop("scanlines", base_fx.scanlines, |p| p.scanlines);
+    out.pixelate = eval_prop("pixelate", base_fx.pixelate, |p| p.pixelate);
+    out.glitch = eval_prop("glitch", base_fx.glitch, |p| p.glitch);
+    out.posterize = eval_prop("posterize", base_fx.posterize, |p| p.posterize);
+    out.rgb_split = eval_prop("rgb_split", base_fx.rgb_split, |p| p.rgb_split);
+    out.camera_shake = eval_prop("camera_shake", base_fx.camera_shake, |p| p.camera_shake);
+    out.motion_trail = eval_prop("motion_trail", base_fx.motion_trail, |p| p.motion_trail);
+    out.glow = eval_prop("glow", base_fx.glow, |p| p.glow);
+    out.light_leak = eval_prop("light_leak", base_fx.light_leak, |p| p.light_leak);
+    out.strobe = eval_prop("strobe", base_fx.strobe, |p| p.strobe);
+    out.tilt_shift = eval_prop("tilt_shift", base_fx.tilt_shift, |p| p.tilt_shift);
+    out.sharpen = eval_prop("sharpen", base_fx.sharpen, |p| p.sharpen);
+    out.duotone = eval_prop("duotone", base_fx.duotone, |p| p.duotone);
+    out.zoom_blur = eval_prop("zoom_blur", base_fx.zoom_blur, |p| p.zoom_blur);
+    out.zoom_pct = eval_prop("zoom_pct", base_fx.zoom_pct, |p| p.zoom_pct);
+    out.rotate_deg = eval_prop("rotate_deg", base_fx.rotate_deg, |p| p.rotate_deg);
+    out.letterbox = eval_prop("letterbox", base_fx.letterbox, |p| p.letterbox);
+    out.halftone_px = eval_prop("halftone_px", base_fx.halftone_px, |p| p.halftone_px);
+    out.neon_edges = eval_prop("neon_edges", base_fx.neon_edges, |p| p.neon_edges);
+    out.ripple_rings = eval_prop("ripple_rings", base_fx.ripple_rings, |p| p.ripple_rings);
+    out.solarize = eval_prop("solarize", base_fx.solarize, |p| p.solarize);
+    out.threshold_bw = eval_prop("threshold_bw", base_fx.threshold_bw, |p| p.threshold_bw);
+    out.bleach_bypass = eval_prop("bleach_bypass", base_fx.bleach_bypass, |p| p.bleach_bypass);
+    out.spotlight_dark = eval_prop("spotlight_dark", base_fx.spotlight_dark, |p| p.spotlight_dark);
+    out.spotlight_radius = eval_prop("spotlight_radius", base_fx.spotlight_radius, |p| p.spotlight_radius);
+    out.wave_a_amp = eval_prop("wave_a_amp", base_fx.wave_a_amp, |p| p.wave_a_amp);
+    out.wave_a_freq = eval_prop("wave_a_freq", base_fx.wave_a_freq, |p| p.wave_a_freq);
+    out.persp_lat = eval_prop("persp_lat", base_fx.persp_lat, |p| p.persp_lat);
+    out.persp_swing = eval_prop("persp_swing", base_fx.persp_swing, |p| p.persp_swing);
+    out.persp_roll = eval_prop("persp_roll", base_fx.persp_roll, |p| p.persp_roll);
+    out.s_fisheye = eval_prop("s_fisheye", base_fx.s_fisheye, |p| p.s_fisheye);
+    out.s_vortex = eval_prop("s_vortex", base_fx.s_vortex, |p| p.s_vortex);
+    out.s_rack_defocus = eval_prop("s_rack_defocus", base_fx.s_rack_defocus, |p| p.s_rack_defocus);
+    out.s_beauty = eval_prop("s_beauty", base_fx.s_beauty, |p| p.s_beauty);
+    out.s_glow = eval_prop("s_glow", base_fx.s_glow, |p| p.s_glow);
+    out.s_halation = eval_prop("s_halation", base_fx.s_halation, |p| p.s_halation);
+    out.s_rays = eval_prop("s_rays", base_fx.s_rays, |p| p.s_rays);
+    out.s_lens_flare = eval_prop("s_lens_flare", base_fx.s_lens_flare, |p| p.s_lens_flare);
+    out.s_film_damage = eval_prop("s_film_damage", base_fx.s_film_damage, |p| p.s_film_damage);
+    out.bcc_film_grain = eval_prop("bcc_film_grain", base_fx.bcc_film_grain, |p| p.bcc_film_grain);
+    out.bcc_mosaic = eval_prop("bcc_mosaic", base_fx.bcc_mosaic, |p| p.bcc_mosaic);
+    out.crt_curvature = eval_prop("crt_curvature", base_fx.crt_curvature, |p| p.crt_curvature);
+    out.crt_scanlines = eval_prop("crt_scanlines", base_fx.crt_scanlines, |p| p.crt_scanlines);
+    out.crt_phosphor = eval_prop("crt_phosphor", base_fx.crt_phosphor, |p| p.crt_phosphor);
 
-    let duration = k1.time_sec - k0.time_sec;
-    if duration <= 0.0001 {
-        return k0.params.clone();
-    }
-
-    let raw_t = ((current_time - k0.time_sec) / duration) as f32;
-    let t = k0.easing.eval(raw_t);
-
-    let mut interpolated = k0.params.clone();
-    interpolated.brightness = k0.params.brightness + (k1.params.brightness - k0.params.brightness) * t;
-    interpolated.contrast = k0.params.contrast + (k1.params.contrast - k0.params.contrast) * t;
-    interpolated.saturation = k0.params.saturation + (k1.params.saturation - k0.params.saturation) * t;
-    interpolated.hue_deg = k0.params.hue_deg + (k1.params.hue_deg - k0.params.hue_deg) * t;
-    interpolated.blur_px = k0.params.blur_px + (k1.params.blur_px - k0.params.blur_px) * t;
-    interpolated.vignette = k0.params.vignette + (k1.params.vignette - k0.params.vignette) * t;
-    interpolated.film_grain = k0.params.film_grain + (k1.params.film_grain - k0.params.film_grain) * t;
-    interpolated.glow = k0.params.glow + (k1.params.glow - k0.params.glow) * t;
-    interpolated.glitch = k0.params.glitch + (k1.params.glitch - k0.params.glitch) * t;
-    interpolated.zoom_pct = k0.params.zoom_pct + (k1.params.zoom_pct - k0.params.zoom_pct) * t;
-    interpolated.rotate_deg = k0.params.rotate_deg + (k1.params.rotate_deg - k0.params.rotate_deg) * t;
-    interpolated.s_glow = k0.params.s_glow + (k1.params.s_glow - k0.params.s_glow) * t;
-    interpolated.s_halation = k0.params.s_halation + (k1.params.s_halation - k0.params.s_halation) * t;
-    interpolated.s_rays = k0.params.s_rays + (k1.params.s_rays - k0.params.s_rays) * t;
-    interpolated.s_lens_flare = k0.params.s_lens_flare + (k1.params.s_lens_flare - k0.params.s_lens_flare) * t;
-    interpolated.s_fisheye = k0.params.s_fisheye + (k1.params.s_fisheye - k0.params.s_fisheye) * t;
-    interpolated.s_vortex = k0.params.s_vortex + (k1.params.s_vortex - k0.params.s_vortex) * t;
-
-    interpolated
+    out
 }
 
 pub fn build_dynamic_ffmpeg_filter(keyframes: &[EffectKeyframe], base_fx: &VideoFxParams) -> String {
@@ -1492,14 +1564,26 @@ pub fn extract_video_frame_rgba(
     let vf_chain = build_preview_vf_chain(fx, w, h);
     let out = Command::new("ffmpeg")
         .args([
+            "-loglevel",
+            "error",
+            "-fflags",
+            "nobuffer+fastseek",
+            "-flags",
+            "low_delay",
+            "-analyzeduration",
+            "0",
+            "-probesize",
+            "32768",
             "-ss",
             &format!("{:.3}", time_sec.max(0.0)),
             "-i",
         ])
         .arg(path)
         .args([
-            "-vframes",
+            "-frames:v",
             "1",
+            "-an",
+            "-sn",
             "-vf",
             &vf_chain,
             "-f",

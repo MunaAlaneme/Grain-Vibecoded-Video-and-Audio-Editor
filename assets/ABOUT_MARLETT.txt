@@ -1,0 +1,16 @@
+Marlett font (optional)
+=======================
+
+The app's window caption buttons (minimize / maximize / close) are drawn with
+the real Marlett font when it is available, and fall back to drawn shapes when
+it is not.
+
+Marlett is a Microsoft font that ships only with Windows; it is NOT freely
+redistributable, so it is intentionally NOT included here. To get the authentic
+glyphs, copy `marlett.ttf` from a Windows installation
+(`C:\Windows\Fonts\marlett.ttf`) into this `assets/` folder. The app loads
+`assets/marlett.ttf` automatically on startup (see `ensure_assets()` in
+`src/main.rs`).
+
+Without the file the UI looks identical — the painter draws the minimize bar,
+maximize/restore boxes, and close ✕ in the same positions and sizes.

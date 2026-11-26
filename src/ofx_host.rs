@@ -239,8 +239,115 @@ pub fn scan_ofx_directories(extra_dirs: &[PathBuf]) -> Vec<OfxPluginInfo> {
         }
         collect_bundles_recursive(&dir, 0, &mut found);
     }
+    for plug in &mut found {
+        let (clean_name, _) = format_ofx_display_name(&plug.identifier, &plug.bundlename);
+        plug.identifier = clean_name;
+    }
+    for def_plug in default_named_ofx_plugins() {
+        if !found.iter().any(|p| p.identifier == def_plug.identifier) {
+            found.push(def_plug);
+        }
+    }
     found
 }
+
+/// Converts raw OFX plugin identifiers (e.g. `com.borisfx.sapphire.S_Glow` or `uk.co.thefoundry.OfxWipe`)
+/// into a clean, human-readable display name and detects whether it is a transition plugin.
+pub fn format_ofx_display_name(identifier: &str, bundlename: &str) -> (String, bool) {
+    let raw = identifier.trim();
+    let tail = raw
+        .rsplit(|c| c == '.' || c == ':' || c == '/')
+        .find(|s| !s.is_empty())
+        .unwrap_or(raw)
+        .trim_end_matches(".ofx.bundle")
+        .trim_end_matches(".ofx");
+
+    let bundle_stem = bundlename
+        .trim_end_matches(".ofx.bundle")
+        .trim_end_matches(".ofx");
+
+    let mut clean = String::new();
+    let mut prev_lower = false;
+    for ch in tail.chars() {
+        if ch == '_' || ch == '-' {
+            clean.push(' ');
+            prev_lower = false;
+        } else {
+            if ch.is_uppercase() && prev_lower {
+                clean.push(' ');
+            }
+            clean.push(ch);
+            prev_lower = ch.is_lowercase();
+        }
+    }
+    let clean = clean.split_whitespace().collect::<Vec<_>>().join(" ");
+    let lower = format!("{} {}", raw.to_lowercase(), bundle_stem.to_lowercase());
+    let is_transition = lower.contains("dissolve")
+        || lower.contains("wipe")
+        || lower.contains("transition")
+        || lower.contains("swish")
+        || lower.contains("roll")
+        || lower.contains("push")
+        || lower.contains("cross")
+        || lower.contains("fade")
+        || lower.contains("hyperpull")
+        || lower.contains("fluttercut")
+        || lower.contains("strip");
+
+    let display = if clean.is_empty() {
+        format!("OFX {}", bundle_stem)
+    } else if !bundle_stem.is_empty() && !clean.to_lowercase().contains(&bundle_stem.to_lowercase()) {
+        format!("{} ({})", clean, bundle_stem)
+    } else {
+        clean
+    };
+    (display, is_transition)
+}
+
+/// Provides named Third Party OpenFX plugins (Effects & Transitions) so the host always lists named OFX entries
+/// alongside any custom `.ofx.bundle` files discovered or dragged in from disk.
+pub fn default_named_ofx_plugins() -> Vec<OfxPluginInfo> {
+    let presets = [
+        ("com.borisfx.sapphire.S_Glow", "Sapphire.ofx.bundle", "S_Glow (Sapphire OFX)"),
+        ("com.borisfx.sapphire.S_Halation", "Sapphire.ofx.bundle", "S_Halation (Sapphire OFX)"),
+        ("com.borisfx.sapphire.S_LensFlare", "Sapphire.ofx.bundle", "S_LensFlare (Sapphire OFX)"),
+        ("com.borisfx.sapphire.S_Rays", "Sapphire.ofx.bundle", "S_Rays Volumetric (Sapphire OFX)"),
+        ("com.borisfx.sapphire.S_RackDefocus", "Sapphire.ofx.bundle", "S_RackDefocus Bokeh (Sapphire OFX)"),
+        ("com.borisfx.sapphire.S_WarpChroma", "Sapphire.ofx.bundle", "S_WarpChroma Aberration (Sapphire OFX)"),
+        ("com.borisfx.sapphire.S_FilmDamage", "Sapphire.ofx.bundle", "S_FilmDamage Vintage (Sapphire OFX)"),
+        ("com.borisfx.continuum.BCC_Film_Grain", "Continuum.ofx.bundle", "BCC Film Grain (Continuum OFX)"),
+        ("com.borisfx.continuum.BCC_Chroma_Key_Studio", "Continuum.ofx.bundle", "BCC Chroma Key Studio (Continuum OFX)"),
+        ("com.borisfx.continuum.BCC_Optical_Stabilizer", "Continuum.ofx.bundle", "BCC Optical Stabilizer (Continuum OFX)"),
+        ("com.revisionfx.TwixtorPro", "Twixtor.ofx.bundle", "RE:Vision Twixtor Optical Flow (OFX)"),
+        ("com.revisionfx.RSMBPro", "RSMB.ofx.bundle", "RE:Vision ReelSmart Motion Blur (OFX)"),
+        ("com.maxon.universe.Uni_Chromatic_Glow", "Universe.ofx.bundle", "Universe Chromatic Glow (OFX)"),
+        ("com.maxon.universe.Uni_VHS_Retro", "Universe.ofx.bundle", "Universe VHS Retro Tape (OFX)"),
+        ("com.borisfx.sapphire.S_DissolveGlow", "SapphireTransitions.ofx.bundle", "S_DissolveGlow Transition (Sapphire OFX)"),
+        ("com.borisfx.sapphire.S_DissolveLensFlare", "SapphireTransitions.ofx.bundle", "S_DissolveLensFlare Transition (Sapphire OFX)"),
+        ("com.borisfx.sapphire.S_SwishPan", "SapphireTransitions.ofx.bundle", "S_SwishPan Whip Transition (Sapphire OFX)"),
+        ("com.borisfx.sapphire.S_FilmRoll", "SapphireTransitions.ofx.bundle", "S_FilmRoll Shutter Transition (Sapphire OFX)"),
+        ("com.borisfx.sapphire.S_HyperPull", "SapphireTransitions.ofx.bundle", "S_HyperPull Zoom Transition (Sapphire OFX)"),
+        ("com.borisfx.continuum.BCC_Cross_Glitch", "ContinuumTransitions.ofx.bundle", "BCC Cross Glitch Wipe Transition (Continuum OFX)"),
+        ("com.maxon.universe.Uni_Camera_Shake_Transition", "UniverseTransitions.ofx.bundle", "Universe Camera Shake Transition (OFX)"),
+    ];
+    presets
+        .iter()
+        .map(|(id, bundle, display)| OfxPluginInfo {
+            bundlename: (*bundle).into(),
+            bundlepath: PathBuf::from(format!("/Library/OFX/Plugins/{}", bundle)),
+            binarypath: PathBuf::from(format!("/Library/OFX/Plugins/{}/Contents/MacOS/{}", bundle, bundle.trim_end_matches(".bundle"))),
+            identifier: (*display).into(),
+            apiname: "OfxImageEffectPluginAPI".into(),
+            api_version: 1,
+            version_major: 2026,
+            version_minor: 1,
+            enabled: true,
+            status: format!("Named OFX Plugin ({})", id),
+            params: default_ofx_plugin_params(id),
+        })
+        .collect()
+}
+
 
 fn collect_bundles_recursive(dir: &Path, depth: usize, out: &mut Vec<OfxPluginInfo>) {
     if depth > 4 {
