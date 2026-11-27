@@ -1,18 +1,65 @@
 [package]
-name = "vegas-ui-reference"
+name = "grain-video-audio-editor"
 version = "0.1.0"
 edition = "2021"
 authors = ["Grain"]
-description = "Vegas Pro 17 UI reference shell in pure Rust + egui 0.29 (matches the three reference screenshots)"
+description = "Grain audio · video lab — Rust/egui port of index.html (audio FX rack + video editor with per-pixel grade, curves, wheels, keyframes, multi-lane timeline)"
+
+[package.metadata.bundle]
+name = "Grain Video Editor"
+identifier = "dev.grain.video-editor"
 
 [dependencies]
 # Pinned to the SAME versions used by the Grain Video Editor project
 # (see Cargo.lock: egui 0.29.1, eframe 0.29). This file drops straight in.
 eframe = { version = "0.29", default-features = true }
 egui = "0.29"
-# PNG decoding for the embedded Grain logo + splash background (include_bytes!).
-# Only the png decoder is enabled to keep the dependency footprint small.
-image = { version = "0.25", default-features = false, features = ["png"] }
+# PNG/JPEG decoding: embedded Grain logo + splash background (include_bytes!),
+# plus imported image media (.png/.jpg) and PNG frame export.
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "bmp", "webp", "gif"] }
+
+# --- Real media / DSP stack (default: pure-Rust, no system libs) ----------
+# rustfft  — FFT phase vocoder / WSOLA pitch & time DSP (audio_dsp.rs)
+# libloading — OpenFX C-ABI plugin host dlopen (ofx_host.rs)
+# hound    — float32 WAV writer (audio export) + built-in WAV decode fallback
+rustfft = "5"
+libloading = "0.8"
+hound = "3"
+
+# --- Native audio plugin hosts ---------------------------------------------
+# VST 2.4 host (`vst` crate, host side of vst-rs), VST 3 host (`vst3-host`,
+# no CPAL/GUI extras), and Apple AudioUnits via direct AudioToolbox FFI in
+# `src/audio_plugins.rs` (no Swift bridge required).
+vst = "0.4"
+vst3-host = { version = "0.11", default-features = false }
+
+# --- Opt-in engines ("better than ffmpeg") --------------------------------
+# Default build = built-in WAV decoder + rustfft DSP + CPAL playback. Enable the engines you
+# want:  cargo build --release --features "symphonia lewton cpal gstreamer video-rs"
+symphonia = { version = "0.6", default-features = false, features = ["mp3", "wav", "flac", "pcm", "ogg", "vorbis", "isomp4"], optional = true }
+lewton = { version = "0.10", optional = true, features = ["ogg"] }
+ogg    = { version = "0.9", optional = true }
+cpal   = { version = "0.15", optional = true }
+gstreamer       = { version = "0.23", optional = true }
+gstreamer-app   = { version = "0.23", optional = true }
+gstreamer-audio = { version = "0.23", optional = true }
+gstreamer-video = { version = "0.23", optional = true }
+video-rs        = { version = "0.6",  optional = true }
+
+[features]
+# CPAL is on by default so audio playback works out of the box. Use
+# `--no-default-features` on systems without an audio device/dev package.
+default = ["cpal"]
+# symphonia — pure-Rust decoder for mp3 / wav / flac / ogg / vorbis / mp4.
+symphonia = ["dep:symphonia"]
+# Alternative Vorbis-in-Ogg decoder (lewton + ogg demuxer).
+lewton = ["dep:lewton", "dep:ogg"]
+# Real-time audio playback through the default output device.
+cpal = ["dep:cpal"]
+# GStreamer (gstreamer-rs) decode + mux — needs libgstreamer-1.0 / -dev installed.
+gstreamer = ["dep:gstreamer", "dep:gstreamer-app", "dep:gstreamer-audio", "dep:gstreamer-video"]
+# video-rs (FFmpeg-backed) frame decode — needs libavcodec etc.
+video-rs = ["dep:video-rs"]
 
 [profile.release]
 opt-level = 3

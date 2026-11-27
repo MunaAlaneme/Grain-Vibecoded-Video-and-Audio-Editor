@@ -144,12 +144,109 @@ pub fn default_ofx_plugin_params(identifier: &str) -> Vec<OfxParamProperty> {
     params
 }
 
+pub const K_OFX_STAT_OK: c_int = 0;
+pub const K_OFX_STAT_ERR_UNSUPPORTED: c_int = 9;
+
+pub const K_OFX_ACTION_LOAD: &str = "OfxActionLoad";
+pub const K_OFX_ACTION_DESCRIBE: &str = "OfxActionDescribe";
+pub const K_OFX_ACTION_DESCRIBE_IN_CONTEXT: &str = "OfxImageEffectActionDescribeInContext";
+pub const K_OFX_ACTION_CREATE_INSTANCE: &str = "OfxActionCreateInstance";
+pub const K_OFX_ACTION_DESTROY_INSTANCE: &str = "OfxActionDestroyInstance";
+pub const K_OFX_IMAGE_EFFECT_ACTION_RENDER: &str = "OfxImageEffectActionRender";
+pub const K_OFX_PROPERTY_SUITE: &str = "OfxPropertySuite";
+pub const K_OFX_PROPERTY_SUITE_V1: c_int = 1;
+
+/// OpenFX `OfxPropertySuiteV1`. Real plugins receive a host table; unsupported
+/// queries return `kOfxStatErrUnsupported` instead of crashing the host.
+#[repr(C)]
+pub struct OfxPropertySuiteV1 {
+    pub prop_set_pointer: unsafe extern "C" fn(*mut c_void, *const c_char, c_int, *mut c_void) -> c_int,
+    pub prop_set_string: unsafe extern "C" fn(*mut c_void, *const c_char, c_int, *const c_char) -> c_int,
+    pub prop_set_double: unsafe extern "C" fn(*mut c_void, *const c_char, c_int, f64) -> c_int,
+    pub prop_set_int: unsafe extern "C" fn(*mut c_void, *const c_char, c_int, c_int) -> c_int,
+    pub prop_set_pointer_n: unsafe extern "C" fn(*mut c_void, *const c_char, c_int, *mut *mut c_void) -> c_int,
+    pub prop_set_string_n: unsafe extern "C" fn(*mut c_void, *const c_char, c_int, *const *const c_char) -> c_int,
+    pub prop_set_double_n: unsafe extern "C" fn(*mut c_void, *const c_char, c_int, *const f64) -> c_int,
+    pub prop_set_int_n: unsafe extern "C" fn(*mut c_void, *const c_char, c_int, *const c_int) -> c_int,
+    pub prop_get_pointer: unsafe extern "C" fn(*mut c_void, *const c_char, c_int, *mut *mut c_void) -> c_int,
+    pub prop_get_string: unsafe extern "C" fn(*mut c_void, *const c_char, c_int, *mut *const c_char) -> c_int,
+    pub prop_get_double: unsafe extern "C" fn(*mut c_void, *const c_char, c_int, *mut f64) -> c_int,
+    pub prop_get_int: unsafe extern "C" fn(*mut c_void, *const c_char, c_int, *mut c_int) -> c_int,
+    pub prop_get_pointer_n: unsafe extern "C" fn(*mut c_void, *const c_char, c_int, *mut *mut c_void) -> c_int,
+    pub prop_get_string_n: unsafe extern "C" fn(*mut c_void, *const c_char, c_int, *mut *const c_char) -> c_int,
+    pub prop_get_double_n: unsafe extern "C" fn(*mut c_void, *const c_char, c_int, *mut f64) -> c_int,
+    pub prop_get_int_n: unsafe extern "C" fn(*mut c_void, *const c_char, c_int, *mut c_int) -> c_int,
+    pub prop_reset: unsafe extern "C" fn(*mut c_void, *const c_char) -> c_int,
+    pub prop_get_dimension: unsafe extern "C" fn(*mut c_void, *const c_char, *mut c_int) -> c_int,
+    pub prop_rewind: unsafe extern "C" fn(*mut c_void, *const c_char) -> c_int,
+    pub prop_get_set: unsafe extern "C" fn(*mut c_void, *mut *mut c_void) -> c_int,
+}
+
+unsafe extern "C" fn prop_set_pointer(_p: *mut c_void, _n: *const c_char, _i: c_int, _v: *mut c_void) -> c_int { K_OFX_STAT_OK }
+unsafe extern "C" fn prop_set_string(_p: *mut c_void, _n: *const c_char, _i: c_int, _v: *const c_char) -> c_int { K_OFX_STAT_OK }
+unsafe extern "C" fn prop_set_double(_p: *mut c_void, _n: *const c_char, _i: c_int, _v: f64) -> c_int { K_OFX_STAT_OK }
+unsafe extern "C" fn prop_set_int(_p: *mut c_void, _n: *const c_char, _i: c_int, _v: c_int) -> c_int { K_OFX_STAT_OK }
+unsafe extern "C" fn prop_set_pointer_n(_p: *mut c_void, _n: *const c_char, _c: c_int, _v: *mut *mut c_void) -> c_int { K_OFX_STAT_OK }
+unsafe extern "C" fn prop_set_string_n(_p: *mut c_void, _n: *const c_char, _c: c_int, _v: *const *const c_char) -> c_int { K_OFX_STAT_OK }
+unsafe extern "C" fn prop_set_double_n(_p: *mut c_void, _n: *const c_char, _c: c_int, _v: *const f64) -> c_int { K_OFX_STAT_OK }
+unsafe extern "C" fn prop_set_int_n(_p: *mut c_void, _n: *const c_char, _c: c_int, _v: *const c_int) -> c_int { K_OFX_STAT_OK }
+unsafe extern "C" fn prop_get_pointer(_p: *mut c_void, _n: *const c_char, _i: c_int, v: *mut *mut c_void) -> c_int { if !v.is_null() { unsafe { *v = std::ptr::null_mut(); } } K_OFX_STAT_OK }
+unsafe extern "C" fn prop_get_string(_p: *mut c_void, _n: *const c_char, _i: c_int, v: *mut *const c_char) -> c_int { if !v.is_null() { unsafe { *v = std::ptr::null(); } } K_OFX_STAT_OK }
+unsafe extern "C" fn prop_get_double(_p: *mut c_void, _n: *const c_char, _i: c_int, v: *mut f64) -> c_int { if !v.is_null() { unsafe { *v = 0.0; } } K_OFX_STAT_OK }
+unsafe extern "C" fn prop_get_int(_p: *mut c_void, _n: *const c_char, _i: c_int, v: *mut c_int) -> c_int { if !v.is_null() { unsafe { *v = 0; } } K_OFX_STAT_OK }
+unsafe extern "C" fn prop_get_pointer_n(_p: *mut c_void, _n: *const c_char, _c: c_int, v: *mut *mut c_void) -> c_int { if !v.is_null() { unsafe { *v = std::ptr::null_mut(); } } K_OFX_STAT_OK }
+unsafe extern "C" fn prop_get_string_n(_p: *mut c_void, _n: *const c_char, _c: c_int, v: *mut *const c_char) -> c_int { if !v.is_null() { unsafe { *v = std::ptr::null(); } } K_OFX_STAT_OK }
+unsafe extern "C" fn prop_get_double_n(_p: *mut c_void, _n: *const c_char, _c: c_int, v: *mut f64) -> c_int { if !v.is_null() { unsafe { *v = 0.0; } } K_OFX_STAT_OK }
+unsafe extern "C" fn prop_get_int_n(_p: *mut c_void, _n: *const c_char, _c: c_int, v: *mut c_int) -> c_int { if !v.is_null() { unsafe { *v = 0; } } K_OFX_STAT_OK }
+unsafe extern "C" fn prop_reset(_p: *mut c_void, _n: *const c_char) -> c_int { K_OFX_STAT_OK }
+unsafe extern "C" fn prop_get_dimension(_p: *mut c_void, _n: *const c_char, n: *mut c_int) -> c_int { if !n.is_null() { unsafe { *n = 0; } } K_OFX_STAT_OK }
+unsafe extern "C" fn prop_rewind(_p: *mut c_void, _n: *const c_char) -> c_int { K_OFX_STAT_OK }
+unsafe extern "C" fn prop_get_set(_p: *mut c_void, out: *mut *mut c_void) -> c_int { if !out.is_null() { unsafe { *out = std::ptr::null_mut(); } } K_OFX_STAT_OK }
+
+static OFX_PROPERTY_SUITE: OfxPropertySuiteV1 = OfxPropertySuiteV1 {
+    prop_set_pointer, prop_set_string, prop_set_double, prop_set_int,
+    prop_set_pointer_n, prop_set_string_n, prop_set_double_n, prop_set_int_n,
+    prop_get_pointer, prop_get_string, prop_get_double, prop_get_int,
+    prop_get_pointer_n, prop_get_string_n, prop_get_double_n, prop_get_int_n,
+    prop_reset, prop_get_dimension, prop_rewind, prop_get_set,
+};
+
+static mut OFX_HOST: OfxHost = OfxHost { host: std::ptr::null_mut(), fetch_suite: Some(host_fetch_suite) };
+
 unsafe extern "C" fn host_fetch_suite(
     _host: *mut c_void,
-    _suitename: *const c_char,
-    _suite_version: c_int,
+    suitename: *const c_char,
+    suite_version: c_int,
 ) -> *const c_void {
+    if suitename.is_null() { return std::ptr::null(); }
+    let name = CStr::from_ptr(suitename).to_string_lossy();
+    if name == K_OFX_PROPERTY_SUITE && (suite_version == K_OFX_PROPERTY_SUITE_V1 || suite_version <= K_OFX_PROPERTY_SUITE_V1) {
+        return &OFX_PROPERTY_SUITE as *const OfxPropertySuiteV1 as *const c_void;
+    }
     std::ptr::null()
+}
+
+fn c_action(action: &str) -> std::ffi::CString { std::ffi::CString::new(action).unwrap() }
+
+pub fn call_ofx_action(plugin: &OfxPlugin, action: &str, handle: *const c_void) -> c_int {
+    let Some(main_entry) = plugin.main_entry else { return K_OFX_STAT_ERR_UNSUPPORTED; };
+    let action = c_action(action);
+    unsafe { main_entry(action.as_ptr(), handle, std::ptr::null_mut(), std::ptr::null_mut()) }
+}
+
+pub fn setup_ofx_plugin(plugin: *mut OfxPlugin) {
+    if plugin.is_null() { return; }
+    unsafe {
+        let host = std::ptr::addr_of_mut!(OFX_HOST);
+        (*host).host = std::ptr::null_mut();
+        (*host).fetch_suite = Some(host_fetch_suite);
+        if let Some(set_host) = (*plugin).set_host { set_host(host); }
+        let handle = plugin as *const OfxPlugin as *const c_void;
+        let _ = call_ofx_action(&*plugin, K_OFX_ACTION_LOAD, handle);
+        let _ = call_ofx_action(&*plugin, K_OFX_ACTION_DESCRIBE, handle);
+        let _ = call_ofx_action(&*plugin, K_OFX_ACTION_DESCRIBE_IN_CONTEXT, handle);
+        let _ = call_ofx_action(&*plugin, K_OFX_ACTION_CREATE_INSTANCE, handle);
+    }
 }
 
 pub fn default_ofx_searchpaths() -> Vec<PathBuf> {
@@ -238,15 +335,6 @@ pub fn scan_ofx_directories(extra_dirs: &[PathBuf]) -> Vec<OfxPluginInfo> {
             continue;
         }
         collect_bundles_recursive(&dir, 0, &mut found);
-    }
-    for plug in &mut found {
-        let (clean_name, _) = format_ofx_display_name(&plug.identifier, &plug.bundlename);
-        plug.identifier = clean_name;
-    }
-    for def_plug in default_named_ofx_plugins() {
-        if !found.iter().any(|p| p.identifier == def_plug.identifier) {
-            found.push(def_plug);
-        }
     }
     found
 }
@@ -423,6 +511,7 @@ pub fn inspect_ofx_binary(
                 if ptr.is_null() {
                     continue;
                 }
+                setup_ofx_plugin(ptr);
                 let plug = &*ptr;
                 let apiname = if plug.plugin_api.is_null() {
                     "Unknown".into()

@@ -1,17 +1,21 @@
+#[cfg(feature = "cpal")]
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use std::io::{BufReader, Read};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicBool, AtomicU64};
+use std::sync::atomic::Ordering;
+use std::sync::{Arc, Mutex, MutexGuard};
 
-/// Shared lock-free master clock & transport state driven directly by the hardware audio callback.
+/// Shared lock-free master clock & transport state. With CPAL enabled this is
+/// driven directly by the hardware callback; without CPAL a lightweight UI tick
+/// advances the same cursor so the rest of the app has one playback API.
 pub struct MasterAvClock {
-    /// Current playback sample index in the active buffer (at hardware sample rate)
+    /// Current playback sample index at `device_sample_rate`.
     pub sample_cursor: AtomicU64,
-    /// Whether real-time playback is currently active
+    /// Whether real-time playback is currently active.
     pub is_playing: AtomicBool,
-    /// Generation counter incremented whenever a seek or live DSP update swaps the buffer
+    /// Generation counter incremented whenever the buffer is swapped.
     pub buffer_gen: AtomicU64,
 }
 
@@ -25,7 +29,7 @@ impl MasterAvClock {
     }
 }
 
-/// Stereo PCM buffer loaded into the real-time CPAL audio engine
+/// Stereo PCM buffer loaded into the real-time audio engine.
 #[derive(Clone, Default)]
 pub struct StereoPcmBuffer {
     pub left: Vec<f32>,
@@ -33,23 +37,91 @@ pub struct StereoPcmBuffer {
     pub sample_rate: u32,
 }
 
-/// True zero-latency hardware audio engine backed by CPAL + lock-free atomic cursor.
-/// Eliminates external `ffplay` subprocess spawning and guarantees sample-accurate A/V sync.
+fn lock_or_recover<'a, T>(mutex: &'a Mutex<T>) -> MutexGuard<'a, T> {
+    mutex.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+#[cfg(feature = "cpal")]
+#[allow(clippy::too_many_arguments)]
+fn write_output<T>(
+    out: &mut [T],
+    clock: &MasterAvClock,
+    pcm: &StereoPcmBuffer,
+    gain: f32,
+    pan: f32,
+    muted: bool,
+    dev_sr: u32,
+    channels: usize,
+) where
+    T: cpal::SizedSample + cpal::FromSample<f32>,
+{
+    if !clock.is_playing.load(Ordering::Relaxed) || muted {
+        out.fill(T::EQUILIBRIUM);
+        return;
+    }
+    let total_frames = pcm.left.len().min(pcm.right.len());
+    if total_frames == 0 {
+        out.fill(T::EQUILIBRIUM);
+        return;
+    }
+    let ratio = pcm.sample_rate.max(1) as f64 / dev_sr.max(1) as f64;
+    let pan = pan.clamp(-1.0, 1.0);
+    let angle = std::f64::consts::FRAC_PI_4 * (pan + 1.0) as f64;
+    let gl = (gain as f64 * angle.cos()).max(-4.0).min(4.0) as f32;
+    let gr = (gain as f64 * angle.sin()).max(-4.0).min(4.0) as f32;
+    let mut cur = clock.sample_cursor.load(Ordering::Relaxed);
+
+    for frame in out.chunks_mut(channels) {
+        let src_pos = (cur as f64 * ratio) as usize;
+        if src_pos >= total_frames {
+            clock.is_playing.store(false, Ordering::Relaxed);
+            frame.fill(T::EQUILIBRIUM);
+            continue;
+        }
+        let l = pcm.left[src_pos] * gl;
+        let r = pcm.right[src_pos] * gr;
+        if channels == 1 {
+            frame[0] = T::from_sample_((l + r) * 0.5);
+        } else {
+            frame[0] = T::from_sample_(l);
+            frame[1] = T::from_sample_(r);
+            for extra in frame.iter_mut().skip(2) {
+                *extra = T::EQUILIBRIUM;
+            }
+        }
+        cur += 1;
+    }
+    clock.sample_cursor.store(cur, Ordering::Relaxed);
+}
+
+/// Real-time audio engine backed by CPAL when the `cpal` feature is enabled.
+/// The UI always talks to this type; a no-device stub keeps `--no-default-features`
+/// builds compiling while still providing a usable silent transport clock.
 pub struct RealtimeAudioEngine {
+    #[cfg(feature = "cpal")]
     _stream: Option<cpal::Stream>,
     pub device_sample_rate: u32,
     pub clock: Arc<MasterAvClock>,
     pub buffer: Arc<Mutex<StereoPcmBuffer>>,
-    pub gain: Arc<Mutex<f32>>,
-    pub muted: Arc<AtomicBool>,
-    pub status_msg: String,
+    gain: Arc<Mutex<f32>>,
+    pan: Arc<Mutex<f32>>,
+    muted: Arc<AtomicBool>,
+    status_msg: String,
+}
+
+impl Default for RealtimeAudioEngine {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl RealtimeAudioEngine {
+    #[cfg(feature = "cpal")]
     pub fn new() -> Self {
         let clock = MasterAvClock::new();
         let buffer = Arc::new(Mutex::new(StereoPcmBuffer::default()));
         let gain = Arc::new(Mutex::new(1.0_f32));
+        let pan = Arc::new(Mutex::new(0.0_f32));
         let muted = Arc::new(AtomicBool::new(false));
 
         let host = cpal::default_host();
@@ -60,6 +132,7 @@ impl RealtimeAudioEngine {
                 clock,
                 buffer,
                 gain,
+                pan,
                 muted,
                 status_msg: "CPAL: No default audio output device found".into(),
             };
@@ -72,128 +145,66 @@ impl RealtimeAudioEngine {
                 clock,
                 buffer,
                 gain,
+                pan,
                 muted,
                 status_msg: "CPAL: Could not query output config".into(),
             };
         };
 
-        let dev_sr = supported_cfg.sample_rate().0;
-        let channels = supported_cfg.channels() as usize;
+        let dev_sr = supported_cfg.sample_rate().0.max(1);
+        let channels = supported_cfg.channels().max(1) as usize;
         let sample_fmt = supported_cfg.sample_format();
         let stream_cfg: cpal::StreamConfig = supported_cfg.into();
-
-        let clock_cb = Arc::clone(&clock);
-        let buf_cb = Arc::clone(&buffer);
-        let gain_cb = Arc::clone(&gain);
-        let muted_cb = Arc::clone(&muted);
-
         let err_fn = |err| eprintln!("[Grain CPAL Audio Error]: {}", err);
 
+        macro_rules! build_stream {
+            ($ty:ty) => {{
+                let clock_cb = Arc::clone(&clock);
+                let buf_cb = Arc::clone(&buffer);
+                let gain_cb = Arc::clone(&gain);
+                let pan_cb = Arc::clone(&pan);
+                let muted_cb = Arc::clone(&muted);
+                device.build_output_stream(
+                    &stream_cfg,
+                    move |out: &mut [$ty], _: &cpal::OutputCallbackInfo| {
+                        let pcm = lock_or_recover(&buf_cb);
+                        let g = *lock_or_recover(&gain_cb);
+                        let pn = *lock_or_recover(&pan_cb);
+                        write_output(
+                            out,
+                            &clock_cb,
+                            &pcm,
+                            g,
+                            pn,
+                            muted_cb.load(Ordering::Relaxed),
+                            dev_sr,
+                            channels,
+                        );
+                    },
+                    err_fn,
+                    None,
+                )
+            }};
+        }
+
         let stream_res = match sample_fmt {
-            cpal::SampleFormat::F32 => device.build_output_stream(
-                &stream_cfg,
-                move |out: &mut [f32], _: &cpal::OutputCallbackInfo| {
-                    if !clock_cb.is_playing.load(Ordering::Relaxed)
-                        || muted_cb.load(Ordering::Relaxed)
-                    {
-                        out.fill(0.0);
-                        return;
-                    }
-                    let g = gain_cb.try_lock().map(|v| *v).unwrap_or(1.0);
-                    let Ok(pcm) = buf_cb.try_lock() else {
-                        out.fill(0.0);
-                        return;
-                    };
-                    let total_frames = pcm.left.len().min(pcm.right.len());
-                    if total_frames == 0 {
-                        out.fill(0.0);
-                        return;
-                    }
-                    let src_sr = pcm.sample_rate.max(1) as f64;
-                    let ratio = src_sr / dev_sr.max(1) as f64;
-                    let mut cur = clock_cb.sample_cursor.load(Ordering::Relaxed);
-
-                    for frame in out.chunks_mut(channels) {
-                        let src_pos = (cur as f64 * ratio) as usize;
-                        if src_pos >= total_frames {
-                            clock_cb.is_playing.store(false, Ordering::Relaxed);
-                            for s in frame.iter_mut() {
-                                *s = 0.0;
-                            }
-                        } else {
-                            let l = pcm.left[src_pos] * g;
-                            let r = pcm.right[src_pos] * g;
-                            if channels == 1 {
-                                frame[0] = (l + r) * 0.5;
-                            } else {
-                                frame[0] = l;
-                                frame[1] = r;
-                                for extra in frame.iter_mut().skip(2) {
-                                    *extra = 0.0;
-                                }
-                            }
-                            cur += 1;
-                        }
-                    }
-                    clock_cb.sample_cursor.store(cur, Ordering::Relaxed);
-                },
-                err_fn,
-                None,
-            ),
-            cpal::SampleFormat::I16 => device.build_output_stream(
-                &stream_cfg,
-                move |out: &mut [i16], _: &cpal::OutputCallbackInfo| {
-                    if !clock_cb.is_playing.load(Ordering::Relaxed)
-                        || muted_cb.load(Ordering::Relaxed)
-                    {
-                        out.fill(0);
-                        return;
-                    }
-                    let g = gain_cb.try_lock().map(|v| *v).unwrap_or(1.0);
-                    let Ok(pcm) = buf_cb.try_lock() else {
-                        out.fill(0);
-                        return;
-                    };
-                    let total_frames = pcm.left.len().min(pcm.right.len());
-                    if total_frames == 0 {
-                        out.fill(0);
-                        return;
-                    }
-                    let src_sr = pcm.sample_rate.max(1) as f64;
-                    let ratio = src_sr / dev_sr.max(1) as f64;
-                    let mut cur = clock_cb.sample_cursor.load(Ordering::Relaxed);
-
-                    for frame in out.chunks_mut(channels) {
-                        let src_pos = (cur as f64 * ratio) as usize;
-                        if src_pos >= total_frames {
-                            clock_cb.is_playing.store(false, Ordering::Relaxed);
-                            for s in frame.iter_mut() {
-                                *s = 0;
-                            }
-                        } else {
-                            let l = (pcm.left[src_pos] * g).clamp(-1.0, 1.0);
-                            let r = (pcm.right[src_pos] * g).clamp(-1.0, 1.0);
-                            frame[0] = (l * 32767.0) as i16;
-                            if channels > 1 {
-                                frame[1] = (r * 32767.0) as i16;
-                            }
-                            cur += 1;
-                        }
-                    }
-                    clock_cb.sample_cursor.store(cur, Ordering::Relaxed);
-                },
-                err_fn,
-                None,
-            ),
-            _ => {
+            cpal::SampleFormat::F32 => build_stream!(f32),
+            cpal::SampleFormat::I16 => build_stream!(i16),
+            cpal::SampleFormat::U16 => build_stream!(u16),
+            cpal::SampleFormat::I32 => build_stream!(i32),
+            cpal::SampleFormat::U32 => build_stream!(u32),
+            cpal::SampleFormat::I8 => build_stream!(i8),
+            cpal::SampleFormat::U8 => build_stream!(u8),
+            other => {
                 return Self {
                     _stream: None,
                     device_sample_rate: dev_sr,
                     clock,
                     buffer,
                     gain,
+                    pan,
                     muted,
-                    status_msg: "CPAL: Unsupported hardware sample format".into(),
+                    status_msg: format!("CPAL: Unsupported hardware sample format {:?}", other),
                 };
             }
         };
@@ -207,8 +218,9 @@ impl RealtimeAudioEngine {
                     clock,
                     buffer,
                     gain,
+                    pan,
                     muted,
-                    status_msg: format!("CPAL Real-Time Audio Engine Active ({} Hz)", dev_sr),
+                    status_msg: format!("CPAL audio ready · {} Hz", dev_sr),
                 }
             }
             Err(e) => Self {
@@ -217,38 +229,96 @@ impl RealtimeAudioEngine {
                 clock,
                 buffer,
                 gain,
+                pan,
                 muted,
                 status_msg: format!("CPAL stream error: {}", e),
             },
         }
     }
 
+    #[cfg(not(feature = "cpal"))]
+    pub fn new() -> Self {
+        Self {
+            device_sample_rate: 48_000,
+            clock: MasterAvClock::new(),
+            buffer: Arc::new(Mutex::new(StereoPcmBuffer::default())),
+            gain: Arc::new(Mutex::new(1.0)),
+            pan: Arc::new(Mutex::new(0.0)),
+            muted: Arc::new(AtomicBool::new(false)),
+            status_msg: "CPAL audio disabled — build with --features cpal for sound".into(),
+        }
+    }
+
     pub fn load_stereo_buffer(&self, left: Vec<f32>, right: Vec<f32>, sample_rate: u32) {
-        if let Ok(mut guard) = self.buffer.lock() {
-            guard.left = left;
-            guard.right = right;
-            guard.sample_rate = sample_rate.max(1);
-            self.clock.buffer_gen.fetch_add(1, Ordering::Relaxed);
+        let mut guard = lock_or_recover(&self.buffer);
+        guard.left = left;
+        guard.right = right;
+        guard.sample_rate = sample_rate.max(1);
+        self.clock.buffer_gen.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn effective_rate(&self) -> u32 {
+        #[cfg(not(feature = "cpal"))]
+        {
+            lock_or_recover(&self.buffer).sample_rate.max(1)
+        }
+        #[cfg(feature = "cpal")]
+        {
+            self.device_sample_rate.max(1)
         }
     }
 
     pub fn seek_seconds(&self, sec: f64) {
-        let target_sample = (sec.max(0.0) * self.device_sample_rate as f64).round() as u64;
-        self.clock.sample_cursor.store(target_sample, Ordering::Relaxed);
+        let target = (sec.max(0.0) * self.effective_rate() as f64).round() as u64;
+        self.clock.sample_cursor.store(target, Ordering::Relaxed);
     }
 
     pub fn play_from_seconds(&self, sec: f64) {
         self.seek_seconds(sec);
-        self.clock.is_playing.store(true, Ordering::Relaxed);
+        self.clock.is_playing.store(true, std::sync::atomic::Ordering::Relaxed);
     }
 
     pub fn pause(&self) {
-        self.clock.is_playing.store(false, Ordering::Relaxed);
+        self.clock.is_playing.store(false, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Advance the clock only in non-CPAL builds; hardware callbacks drive the
+    /// clock in normal builds.
+    pub fn advance(&self, dt: f32) {
+        #[cfg(not(feature = "cpal"))]
+        {
+            if self.clock.is_playing.load(std::sync::atomic::Ordering::Relaxed) {
+                let step = (dt.max(0.0) as f64 * self.effective_rate() as f64).round() as u64;
+                self.clock.sample_cursor.fetch_add(step, Ordering::Relaxed);
+            }
+        }
+        #[cfg(feature = "cpal")]
+        let _ = dt;
     }
 
     pub fn current_time_seconds(&self) -> f64 {
-        let cur = self.clock.sample_cursor.load(Ordering::Relaxed);
-        cur as f64 / self.device_sample_rate.max(1) as f64
+        self.clock.sample_cursor.load(Ordering::Relaxed) as f64
+            / self.effective_rate() as f64
+    }
+
+    pub fn is_playing(&self) -> bool {
+        self.clock.is_playing.load(Ordering::Relaxed)
+    }
+
+    pub fn set_gain(&self, gain: f32) {
+        *lock_or_recover(&self.gain) = gain;
+    }
+
+    pub fn set_pan(&self, pan: f32) {
+        *lock_or_recover(&self.pan) = pan.clamp(-1.0, 1.0);
+    }
+
+    pub fn set_muted(&self, muted: bool) {
+        self.muted.store(muted, Ordering::Relaxed);
+    }
+
+    pub fn status_message(&self) -> &str {
+        &self.status_msg
     }
 }
 
@@ -289,7 +359,7 @@ impl ContinuousVideoStream {
     }
 
     /// Reads the exact RGBA frame at `target_sec` with `vf_chain`, reusing the running pipe
-    /// whenever sequential playback advances forward within 0.25s.
+    /// whenever sequential playback advances forward within 0.35s.
     pub fn read_frame_at(
         &mut self,
         path: &Path,
@@ -300,7 +370,6 @@ impl ContinuousVideoStream {
         let dt = target_sec - self.stream_time_sec;
         let same_source = self.active_path.as_deref() == Some(path) && self.active_vf == vf_chain;
 
-        // Restart pipe only on seek backwards, large jump, clip change, or FX chain change
         if !same_source || self.reader.is_none() || dt < -0.02 || dt > 0.35 {
             self.stop();
             let mut child = Command::new("ffmpeg")
@@ -353,7 +422,6 @@ impl ContinuousVideoStream {
         let step = 1.0 / self.fps;
         let mut buf = vec![0u8; frame_bytes];
 
-        // Advance sequentially until `stream_time_sec` reaches `target_sec`
         loop {
             reader
                 .read_exact(&mut buf)

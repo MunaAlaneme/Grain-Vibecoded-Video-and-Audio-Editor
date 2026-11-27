@@ -19,7 +19,7 @@ fi
 
 echo "Building native Apple Silicon (aarch64-apple-darwin) .app bundle..."
 rustup target add aarch64-apple-darwin || true
-RUSTFLAGS="-C target-cpu=apple-m3" cargo bundle --release --target aarch64-apple-darwin
+RUSTFLAGS="-C target-cpu=apple-m3" cargo bundle --release --target aarch64-apple-darwin --features cpal
 
 APP_PATH="target/aarch64-apple-darwin/release/bundle/osx/Grain Video Editor.app"
 echo "Built macOS App: ${APP_PATH}"
