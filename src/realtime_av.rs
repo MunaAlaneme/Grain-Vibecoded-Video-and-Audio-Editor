@@ -50,6 +50,7 @@ fn write_output<T>(
     gain: f32,
     pan: f32,
     muted: bool,
+    rate: f32,
     dev_sr: u32,
     channels: usize,
 ) where
@@ -64,7 +65,8 @@ fn write_output<T>(
         out.fill(T::EQUILIBRIUM);
         return;
     }
-    let ratio = pcm.sample_rate.max(1) as f64 / dev_sr.max(1) as f64;
+    let rate = rate.clamp(0.25, 4.0) as f64;
+    let ratio = pcm.sample_rate.max(1) as f64 / dev_sr.max(1) as f64 * rate;
     let pan = pan.clamp(-1.0, 1.0);
     let angle = std::f64::consts::FRAC_PI_4 * (pan + 1.0) as f64;
     let gl = (gain as f64 * angle.cos()).max(-4.0).min(4.0) as f32;
@@ -105,6 +107,7 @@ pub struct RealtimeAudioEngine {
     pub buffer: Arc<Mutex<StereoPcmBuffer>>,
     gain: Arc<Mutex<f32>>,
     pan: Arc<Mutex<f32>>,
+    rate: Arc<Mutex<f32>>,
     muted: Arc<AtomicBool>,
     status_msg: String,
 }
@@ -122,6 +125,7 @@ impl RealtimeAudioEngine {
         let buffer = Arc::new(Mutex::new(StereoPcmBuffer::default()));
         let gain = Arc::new(Mutex::new(1.0_f32));
         let pan = Arc::new(Mutex::new(0.0_f32));
+        let rate = Arc::new(Mutex::new(1.0_f32));
         let muted = Arc::new(AtomicBool::new(false));
 
         let host = cpal::default_host();
@@ -133,6 +137,7 @@ impl RealtimeAudioEngine {
                 buffer,
                 gain,
                 pan,
+                rate: Arc::clone(&rate),
                 muted,
                 status_msg: "CPAL: No default audio output device found".into(),
             };
@@ -146,6 +151,7 @@ impl RealtimeAudioEngine {
                 buffer,
                 gain,
                 pan,
+                rate: Arc::clone(&rate),
                 muted,
                 status_msg: "CPAL: Could not query output config".into(),
             };
@@ -163,6 +169,7 @@ impl RealtimeAudioEngine {
                 let buf_cb = Arc::clone(&buffer);
                 let gain_cb = Arc::clone(&gain);
                 let pan_cb = Arc::clone(&pan);
+                let rate_cb = Arc::clone(&rate);
                 let muted_cb = Arc::clone(&muted);
                 device.build_output_stream(
                     &stream_cfg,
@@ -170,6 +177,7 @@ impl RealtimeAudioEngine {
                         let pcm = lock_or_recover(&buf_cb);
                         let g = *lock_or_recover(&gain_cb);
                         let pn = *lock_or_recover(&pan_cb);
+                        let rt = *lock_or_recover(&rate_cb);
                         write_output(
                             out,
                             &clock_cb,
@@ -177,6 +185,7 @@ impl RealtimeAudioEngine {
                             g,
                             pn,
                             muted_cb.load(Ordering::Relaxed),
+                            rt,
                             dev_sr,
                             channels,
                         );
@@ -203,6 +212,7 @@ impl RealtimeAudioEngine {
                     buffer,
                     gain,
                     pan,
+                    rate: Arc::clone(&rate),
                     muted,
                     status_msg: format!("CPAL: Unsupported hardware sample format {:?}", other),
                 };
@@ -219,6 +229,7 @@ impl RealtimeAudioEngine {
                     buffer,
                     gain,
                     pan,
+                    rate: Arc::clone(&rate),
                     muted,
                     status_msg: format!("CPAL audio ready · {} Hz", dev_sr),
                 }
@@ -230,6 +241,7 @@ impl RealtimeAudioEngine {
                 buffer,
                 gain,
                 pan,
+                rate: Arc::clone(&rate),
                 muted,
                 status_msg: format!("CPAL stream error: {}", e),
             },
@@ -244,6 +256,7 @@ impl RealtimeAudioEngine {
             buffer: Arc::new(Mutex::new(StereoPcmBuffer::default())),
             gain: Arc::new(Mutex::new(1.0)),
             pan: Arc::new(Mutex::new(0.0)),
+            rate: Arc::new(Mutex::new(1.0)),
             muted: Arc::new(AtomicBool::new(false)),
             status_msg: "CPAL audio disabled — build with --features cpal for sound".into(),
         }
@@ -269,7 +282,8 @@ impl RealtimeAudioEngine {
     }
 
     pub fn seek_seconds(&self, sec: f64) {
-        let target = (sec.max(0.0) * self.effective_rate() as f64).round() as u64;
+        let rate = *lock_or_recover(&self.rate) as f64;
+        let target = (sec.max(0.0) * self.effective_rate() as f64 * rate).round() as u64;
         self.clock.sample_cursor.store(target, Ordering::Relaxed);
     }
 
@@ -288,7 +302,8 @@ impl RealtimeAudioEngine {
         #[cfg(not(feature = "cpal"))]
         {
             if self.clock.is_playing.load(std::sync::atomic::Ordering::Relaxed) {
-                let step = (dt.max(0.0) as f64 * self.effective_rate() as f64).round() as u64;
+                let rate = *lock_or_recover(&self.rate) as f64;
+                let step = (dt.max(0.0) as f64 * self.effective_rate() as f64 * rate).round() as u64;
                 self.clock.sample_cursor.fetch_add(step, Ordering::Relaxed);
             }
         }
@@ -297,8 +312,9 @@ impl RealtimeAudioEngine {
     }
 
     pub fn current_time_seconds(&self) -> f64 {
+        let rate = *lock_or_recover(&self.rate) as f64;
         self.clock.sample_cursor.load(Ordering::Relaxed) as f64
-            / self.effective_rate() as f64
+            / (self.effective_rate() as f64 * rate.max(0.0001))
     }
 
     pub fn is_playing(&self) -> bool {
@@ -311,6 +327,10 @@ impl RealtimeAudioEngine {
 
     pub fn set_pan(&self, pan: f32) {
         *lock_or_recover(&self.pan) = pan.clamp(-1.0, 1.0);
+    }
+
+    pub fn set_rate(&self, rate: f32) {
+        *lock_or_recover(&self.rate) = rate.clamp(0.25, 4.0);
     }
 
     pub fn set_muted(&self, muted: bool) {

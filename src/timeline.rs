@@ -281,7 +281,7 @@ pub fn hit_item(items: &[TimelineItem], p: Pos2, origin: Pos2, zoom: f32, lane_t
         let rendered_dur = (it.dur * zoom).max(8.0) / zoom;
         let hit_end = it.start + rendered_dur;
         if t < it.start || t >= hit_end { continue; }
-        let edge_px = (7.0 / zoom).min(rendered_dur * 0.25).max(0.0);
+        let edge_px = (12.0 / zoom).min(rendered_dur * 0.33).max(0.0);
         // Half-open span: an exact shared edge belongs to the next clip.
         if t - it.start < edge_px { return Some((i, DragMode::TrimIn)); }
         if hit_end - t <= edge_px { return Some((i, DragMode::TrimOut)); }

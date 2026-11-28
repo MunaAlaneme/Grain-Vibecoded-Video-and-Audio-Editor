@@ -537,6 +537,8 @@ struct OfxFx {
     intensity: f32,
     p_a: f32, // threshold / blur_amount / amplitude
     p_b: f32, // radius / frequency
+    /// Full OFX plugin parameters (not just the four mapped render fields).
+    params: Vec<ofx_host::OfxParamProperty>,
 }
 
 #[derive(Clone, Copy, PartialEq, Debug)]
@@ -711,7 +713,7 @@ struct AudioState {
     p_tech: PitchTech, p_amt: f32, fft_size: u32, fm_amt: f32, fm_keep: bool,
     t_tech: PitchTech, t_amt: f32,
     v_mode: VibMode, v_tech: PitchTech, v_rate: f32, v_depth: f32,
-    s_amt: f32,
+    s_amt: f32, s_start: f32, s_end: f32, s_sliding: bool,
     b_bits: i32, b_sr: i32,
     vc_wave: VocWave, vc_freq: f32, vc_bands: i32,
     tr_wave: TremWave, tr_rate: f32, tr_depth: f32,
@@ -725,6 +727,25 @@ struct AudioState {
     fx_cancel_requested: bool,
     fx_loading_status: String,
     fx_rx: Option<std::sync::mpsc::Receiver<Result<AudioFxLoad, String>>>,
+    /// Separate Audio FX popup window.
+    audio_fx_popup_open: bool,
+}
+
+/// Vegas-style New Project properties.
+#[derive(Clone)]
+struct NewProjectDraft {
+    name: String,
+    width: u32,
+    height: u32,
+    fps: f32,
+    sample_rate: u32,
+    save_path: String,
+}
+
+impl Default for NewProjectDraft {
+    fn default() -> Self {
+        Self { name: "Untitled Project".into(), width: 1920, height: 1080, fps: 30.0, sample_rate: 48_000, save_path: String::new() }
+    }
 }
 
 struct GrainApp {
@@ -739,7 +760,7 @@ struct GrainApp {
     /// Real-time CPAL playback engine (silent clock stub when CPAL is disabled).
     audio_engine: realtime_av::RealtimeAudioEngine,
     /// Decoded A2 music clips, keyed by source path (avoids repeat ffmpeg work).
-    audio_clip_cache: HashMap<std::path::PathBuf, (Vec<f32>, Vec<f32>, u32)>,
+    audio_clip_cache: HashMap<std::path::PathBuf, std::sync::Arc<(Vec<f32>, Vec<f32>, u32)>>,
     /// Signature of the A2 mix; rebuilding only when it changes keeps playback stable.
     last_audio_mix_key: String,
     preview_drop_rect: Option<Rect>,
@@ -757,6 +778,7 @@ struct GrainApp {
     plugin_filter: String,
     plugin_slot_sel: usize,
     window_maximized: bool,
+    fps_smoothed: f32,
     /// Editing workspaces: named panel arrangements recallable from the top bar.
     layouts: Vec<WorkspaceLayout>,
     active_layout: usize,
@@ -770,6 +792,16 @@ struct GrainApp {
     tl_drop_target: Option<(usize, f32)>,
     /// Selected effect shown in a modal popup.
     selected_fx: Option<String>,
+    project_name: String,
+    project_path: Option<std::path::PathBuf>,
+    project_dirty: bool,
+    close_project_open: bool,
+    new_project_open: bool,
+    new_project_draft: NewProjectDraft,
+    pending_close_window: bool,
+    /// Vegas-style Ctrl+G "Go to time" popup.
+    go_to_time_open: bool,
+    go_to_time_input: String,
     /// Async Video FX scan with cancel/pause.
     video_fx_loading: bool,
     video_fx_paused: bool,
@@ -853,7 +885,7 @@ impl Default for AudioState {
             p_tech: PitchTech::Fft, p_amt: 0.0, fft_size: 2048, fm_amt: 0.0, fm_keep: false,
             t_tech: PitchTech::Fft, t_amt: 1.0,
             v_mode: VibMode::A, v_tech: PitchTech::Fft, v_rate: 5.0, v_depth: 0.5,
-            s_amt: 1.0, b_bits: 8, b_sr: 4,
+            s_amt: 1.0, s_start: 1.0, s_end: 1.0, s_sliding: false, b_bits: 8, b_sr: 4,
             vc_wave: VocWave::Saw, vc_freq: 110.0, vc_bands: 16,
             tr_wave: TremWave::Sine, tr_rate: 5.0, tr_depth: 0.8,
             mp_tech: PitchTech::Fft, mp_intervals: [false, false, false, false, true, false, false, true, false],
@@ -861,7 +893,7 @@ impl Default for AudioState {
             sf_type: StudioFx::Wah, sf_rate: 1.0, sf_depth: 0.7, sf_decay: 2.0, sf_mix: 0.6, sf_fc: 1000.0, sf_gain: 0.0, sf_in: 1.0, sf_out: 1.0,
             processing: false, progress: 0.0, done: false, status: String::new(),
             fx_loading: false, fx_paused: false, fx_cancel_requested: false,
-            fx_loading_status: String::new(), fx_rx: None,
+            fx_loading_status: String::new(), fx_rx: None, audio_fx_popup_open: false,
         }
     }
 }
@@ -884,7 +916,7 @@ impl Default for GrainApp {
             plugins: PluginChain::new(44_100),
             plugin_filter: String::new(),
             plugin_slot_sel: 0,
-            window_maximized: false,
+            window_maximized: false, fps_smoothed: 0.0,
             layouts: WorkspaceLayout::defaults(),
             active_layout: 0,
             layout_window_open: false,
@@ -893,6 +925,9 @@ impl Default for GrainApp {
             timeline_ui: TimelineUi::default(),
             tl_drop_target: None,
             selected_fx: None,
+            project_name: "Grain Demo Project".into(), project_path: None, project_dirty: false,
+            close_project_open: false, new_project_open: false, new_project_draft: NewProjectDraft::default(),
+            pending_close_window: false, go_to_time_open: false, go_to_time_input: String::new(),
             video_fx_loading: false, video_fx_paused: false, video_fx_cancel_requested: false,
             video_fx_status: String::new(), video_fx_rx: None,
         };
@@ -959,39 +994,66 @@ impl GrainApp {
         let (pw, ph) = preview_dims(1920, 1080);
         self.video.fw = pw;
         self.video.fh = ph;
-        let clips = [
-            ("Demo · SMPTE Bars", 4.0, G::SmpteBars),
-            ("Demo · Gradient", 4.0, G::ColorGradient),
-            ("Demo · Test Grid", 4.0, G::TestGrid),
+        // Better demo: every real media generator, on V1 and V2+, with titles.
+        let gens = [
+            G::SmpteBars, G::Checkerboard, G::ColorGradient, G::SolidColor,
+            G::PerlinNoiseTexture, G::CreditRoll, G::TimecodeBurnIn, G::TestGrid,
         ];
-        self.video.seq = clips.iter().map(|(name, dur, gen)| {
-            let mut c = VideoClip::new((*name).into(), *dur, None);
+        let names = ["SMPTE Bars","Checkerboard","Color Gradient","Solid Matte","Perlin Clouds","Credit Roll","Timecode Burn-In","Calibration Grid"];
+        let seg_dur = 2.0_f32;
+        self.video.duration = seg_dur * gens.len() as f32;
+        self.video.seq = gens.iter().enumerate().map(|(i, gen)| {
+            let mut c = VideoClip::new(format!("Demo · {}", names[i]), seg_dur, None);
             c.gen = Some(*gen);
             c
         }).collect();
+        // V2+ overlay demo using the same generators on a separate track.
+        if self.video.extra_tracks.is_empty() { self.video.extra_tracks.push(Vec::new()); }
+        let mut overlay = VideoClip::new("Demo · V2 Calibration".into(), seg_dur * gens.len() as f32, None);
+        overlay.gen = Some(G::TestGrid);
+        overlay.track = 1; overlay.start = 0.0;
+        self.video.extra_tracks[0].push(overlay);
         self.video.sel = vec![0];
         self.video.texts.push(TextOverlay {
             uid: fresh_clip_uid(),
             t: "GRAIN DEMO".into(), size: 9.0, x: 50.0, y: 12.0,
             a: 0.0, b: 1e9, col: Color32::WHITE,
         });
+        let overcast = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("assets").join("Kevin MacLeod - Overcast.mp3");
+        let (mut sr, mut audio_len, mut inter) = (44_100_u32, self.video.duration, Vec::new());
+        if let Ok((l, r, rate)) = media_engine::decode_audio_stereo(&overcast) {
+            sr = rate.max(1);
+            let n = l.len().min(r.len());
+            inter = Vec::with_capacity(n * 2);
+            for i in 0..n { inter.push(l[i]); inter.push(r[i]); }
+            audio_len = (n as f32 / sr as f32).max(0.1);
+        }
+        if inter.is_empty() {
+            inter = make_demo_stereo_samples(self.video.duration, sr);
+            audio_len = self.video.duration;
+        }
+        let music_dur = audio_len.min(self.video.duration).max(0.1);
+        let music_path = if overcast.exists() { Some(overcast.clone()) } else { None };
         self.video.music.push(MusicClip {
             uid: fresh_clip_uid(),
-            track: 0, nm: "Demo Score (generated)".into(), dur: 12.0, start: 0.0, vol: 80.0, path: None,
+            track: 0, nm: "Kevin MacLeod — Overcast".into(), dur: music_dur, start: 0.0, vol: 80.0,
+            path: music_path,
         });
         self.audio.is_demo = true;
         self.audio.loaded = true;
-        self.audio.filename = "demo_score.wav".into();
-        self.audio.sample_rate = 44_100;
+        self.audio.filename = "Kevin MacLeod - Overcast.mp3".into();
+        self.audio.sample_rate = sr;
         self.audio.channels = 2;
-        self.audio.duration = 12.0;
-        self.audio.samples = make_demo_stereo_samples(12.0, 44_100);
+        self.audio.duration = audio_len;
+        self.plugins.set_sample_rate(sr);
+        self.audio.samples = inter;
         self.audio.playhead = 0.0;
         self.audio.sel_start = 0.0;
-        self.audio.sel_end = 12.0;
+        self.audio.sel_end = audio_len;
         self.audio.is_playing = false;
-        self.audio.status = "Demo project loaded · generators + generated stereo score.".into();
-        self.video.status = "Demo project ready · Space plays video + audio.".into();
+        self.audio.status = "Demo project loaded · all 8 media generators + Kevin MacLeod — Overcast.".into();
+        self.video.status = "Demo project ready · 8 generator clips on V1 + V2 · Kevin MacLeod — Overcast.".into();
         self.video.dirty = true;
         self.last_audio_mix_key.clear();
         self.reload_playback_buffer();
@@ -1057,6 +1119,7 @@ impl GrainApp {
         self.audio_engine.set_pan(self.audio.track_pan);
         let muted = self.audio.mute || !self.video.track_active(2);
         self.audio_engine.set_muted(muted);
+        self.audio_engine.set_rate(self.video.speed.clamp(0.25, 4.0));
     }
 
     fn audio_mix_key(&self) -> String {
@@ -1112,16 +1175,16 @@ impl GrainApp {
         let mut left = vec![0.0_f32; frames];
         let mut right = vec![0.0_f32; frames];
 
-        for m in self.video.music.clone() {
+        for m in self.video.music.iter() {
             if !self.video.audio_track_active(m.track) { continue; }
-            let (src_l, src_r) = if let Some(path) = m.path.clone() {
-                let decoded = if let Some(cached) = self.audio_clip_cache.get(&path) {
-                    cached.clone()
+            let (src_l, src_r) = if let Some(path) = m.path.as_ref() {
+                let decoded = if let Some(cached) = self.audio_clip_cache.get(path) {
+                    cached
                 } else {
-                    match media_engine::decode_audio_stereo(&path) {
+                    match media_engine::decode_audio_stereo(path) {
                         Ok(d) => {
-                            self.audio_clip_cache.insert(path.clone(), d.clone());
-                            d
+                            self.audio_clip_cache.insert(path.clone(), std::sync::Arc::new(d));
+                            self.audio_clip_cache.get(path).expect("just inserted").as_ref()
                         }
                         Err(e) => {
                             self.video.status = format!("A2 clip decode failed ({}): {}", m.nm, e);
@@ -1284,19 +1347,166 @@ impl GrainApp {
         }
     }
 
+    fn save_current_project(&mut self) -> bool {
+        let path = self.project_path.clone()
+            .unwrap_or_else(|| media_engine::default_export_path("grain_project.otio"));
+        self.save_project_to(&path)
+    }
+
+    fn save_project_to(&mut self, path: &std::path::Path) -> bool {
+        let name = self.project_name.clone();
+        let fps = self.video.fps;
+        let mut acc = 0.0_f32;
+        let mut clips: Vec<(String, f32, f32, f32)> = Vec::new();
+        for c in &self.video.seq {
+            let l = c.len(); clips.push((c.name.clone(), acc, l, c.speed)); acc += l;
+        }
+        for track in &self.video.extra_tracks {
+            for c in track { clips.push((c.name.clone(), c.start, c.len(), c.speed)); }
+        }
+        if let Some(parent) = path.parent() { let _ = std::fs::create_dir_all(parent); }
+        match bananav_suite::export_project_interchange(path, &name, fps, &clips) {
+            Ok(msg) => {
+                self.project_path = Some(path.to_path_buf());
+                self.project_dirty = false;
+                self.video.status = msg;
+                true
+            }
+            Err(e) => { self.video.status = format!("Save project failed: {e}"); false }
+        }
+    }
+
+    fn close_project(&mut self, ctx: &egui::Context) {
+        let close_window = self.pending_close_window;
+        self.create_new_project(ctx);
+        self.close_project_open = false;
+        self.pending_close_window = false;
+        if close_window { ctx.send_viewport_cmd(egui::ViewportCommand::Close); }
+    }
+
+    fn create_new_project(&mut self, ctx: &egui::Context) {
+        let name = self.new_project_draft.name.clone();
+        let width = self.new_project_draft.width.max(16) & !1;
+        let height = self.new_project_draft.height.max(16) & !1;
+        let fps = self.new_project_draft.fps.clamp(1.0, 240.0);
+        let sample_rate = self.new_project_draft.sample_rate.max(8000);
+        let save_path = self.new_project_draft.save_path.trim().to_string();
+
+        self.video = VideoState::default();
+        self.audio = AudioState::default();
+        self.timeline_ui = TimelineUi::default();
+        self.layouts = WorkspaceLayout::defaults();
+        self.active_layout = 0;
+        self.video.loaded = true;
+        self.video.is_demo = false;
+        self.video.filename = name.clone();
+        self.video.fw = width as usize; self.video.fh = height as usize;
+        self.video.source_w = width; self.video.source_h = height;
+        self.video.fps = fps; self.video.duration = 1.0; self.video.playhead = 0.0;
+        self.video.dirty = true;
+        self.audio.sample_rate = sample_rate;
+        self.audio.channels = 2; self.audio.duration = 0.0; self.audio.samples.clear(); self.audio.loaded = false; self.audio.is_demo = false;
+        self.audio.playhead = 0.0; self.audio.sel_start = 0.0; self.audio.sel_end = 0.0;
+        self.plugins.set_sample_rate(sample_rate);
+        self.project_name = name;
+        self.project_path = if save_path.is_empty() { None } else { Some(std::path::PathBuf::from(save_path)) };
+        self.project_dirty = false;
+        self.video.status = format!("New project · {}×{} · {:.3} fps · {} Hz", width, height, fps, sample_rate);
+        self.reload_playback_buffer();
+        self.new_project_open = false;
+        let _ = ctx;
+    }
+
+    fn render_project_popups(&mut self, ctx: &egui::Context) {
+        if self.close_project_open {
+            let mut open = true;
+            egui::Window::new("Close Project").collapsible(false).resizable(false).anchor(egui::Align2::CENTER_CENTER, [0.0,0.0]).open(&mut open).show(ctx, |ui| {
+                ui.label(RichText::new(format!("Close “{}”?", self.project_name)).color(INK).size(12.0));
+                ui.label(RichText::new("Save changes, discard them, or cancel.").color(SUB).size(10.0));
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    if ui.button("Save").clicked() {
+                        if self.save_current_project() { self.close_project(ctx); }
+                    }
+                    if ui.button("Don't Save").clicked() { self.close_project(ctx); }
+                    if ui.button("Cancel").clicked() { self.close_project_open = false; self.pending_close_window = false; }
+                });
+            });
+            if !open { self.close_project_open = false; self.pending_close_window = false; }
+        }
+
+        if self.new_project_open {
+            let mut open = true;
+            egui::Window::new("New Project").collapsible(false).resizable(false).anchor(egui::Align2::CENTER_CENTER, [0.0,0.0]).default_width(360.0).min_width(360.0).max_width(360.0).open(&mut open).show(ctx, |ui| {
+                ui.label(RichText::new("Project properties").color(ACCENT).size(11.0));
+                let d = &mut self.new_project_draft;
+                ui.horizontal(|ui| { ui.label("Name"); ui.text_edit_singleline(&mut d.name); });
+                ui.horizontal(|ui| { ui.label("Width"); ui.add(egui::DragValue::new(&mut d.width).speed(1).clamp_range(16..=7680)); });
+                ui.horizontal(|ui| { ui.label("Height"); ui.add(egui::DragValue::new(&mut d.height).speed(1).clamp_range(16..=4320)); });
+                ui.horizontal(|ui| { ui.label("Frame rate"); ui.add(egui::DragValue::new(&mut d.fps).speed(0.01).clamp_range(1.0..=240.0)); });
+                ui.horizontal(|ui| { ui.label("Audio rate"); ui.add(egui::DragValue::new(&mut d.sample_rate).speed(1).clamp_range(8000..=192000)); });
+                ui.horizontal(|ui| { ui.label("Save to"); ui.text_edit_singleline(&mut d.save_path); });
+                ui.add_space(6.0);
+                ui.horizontal(|ui| {
+                    if ui.button("Create").clicked() { self.create_new_project(ctx); }
+                    if ui.button("Cancel").clicked() { self.new_project_open = false; }
+                });
+            });
+            if !open { self.new_project_open = false; }
+        }
+    }
+
+    fn render_go_to_time_popup(&mut self, ctx: &egui::Context) {
+        if !self.go_to_time_open { return; }
+        let mut open = true;
+        egui::Window::new("Go to Time")
+            .collapsible(false).resizable(false).anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            .open(&mut open).default_width(300.0).min_width(300.0).max_width(300.0).show(ctx, |ui| {
+                ui.label(RichText::new("Jump playhead to exact timecode").color(SUB).size(10.0));
+                let response = ui.add(egui::TextEdit::singleline(&mut self.go_to_time_input)
+                    .hint_text(format!("{} or seconds", fmt_tc_frames(self.video.playhead))).desired_width(ui.available_width()));
+                ui.label(RichText::new(format!("fps {:.3} · total {}", self.video.fps, fmt_tc_frames(self.video.total()))).color(SUB).size(9.5));
+                let enter = response.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+                if ui.button("Go").clicked() || enter {
+                    if let Some(t) = parse_timecode(&self.go_to_time_input, self.video.fps) {
+                        self.seek_transport(t.min(self.timeline_end()));
+                        self.go_to_time_open = false;
+                    }
+                }
+                if ui.button("Cancel").clicked() { self.go_to_time_open = false; }
+            });
+        if !open { self.go_to_time_open = false; }
+    }
+
     fn render_top_bar(&mut self, ctx: &egui::Context) {
         egui::TopBottomPanel::top("grain_top")
             .exact_height(46.0)
             .frame(egui::Frame::default().fill(PANEL2).stroke(Stroke::new(1.0_f32, LINE)).inner_margin(egui::Margin::symmetric(10.0, 0.0)))
             .show(ctx, |ui| {
                 let rect = ui.max_rect();
-                let p = ui.painter();
+                let p = ui.painter().clone();
                 let cy = rect.center().y;
                 // Grain wordmark
                 p.text(pos2(rect.left() + 2.0, cy), egui::Align2::LEFT_CENTER, "Grain", FontId::proportional(16.0), INK);
                 p.text(pos2(rect.left() + 58.0, cy), egui::Align2::LEFT_CENTER, "NLE", FontId::proportional(10.0), ACCENT);
+                // Vegas-style project toolbar.
+                let nr = Rect::from_min_size(pos2(rect.left() + 90.0, cy - 10.0), vec2(82.0, 20.0));
+                if ui.put(nr, egui::Button::new(RichText::new("New Project").size(9.5))).clicked() {
+                    self.new_project_draft.name = format!("{} Copy", self.project_name);
+                    self.new_project_draft.width = self.video.source_w.max(16);
+                    self.new_project_draft.height = self.video.source_h.max(16);
+                    self.new_project_draft.fps = self.video.fps;
+                    self.new_project_draft.sample_rate = self.audio.sample_rate;
+                    self.new_project_draft.save_path.clear();
+                    self.new_project_open = true;
+                }
+                let cr = Rect::from_min_size(pos2(rect.left() + 176.0, cy - 10.0), vec2(92.0, 20.0));
+                if ui.put(cr, egui::Button::new(RichText::new("Close Project").size(9.5))).clicked() {
+                    self.pending_close_window = false; self.close_project_open = true;
+                }
+                p.text(pos2(rect.left() + 272.0, cy), egui::Align2::LEFT_CENTER, &self.project_name, FontId::proportional(9.5), SUB);
                 // transport cluster
-                let mut x = rect.left() + 96.0;
+                let mut x = rect.left() + 392.0;
                 let total = self.video.total();
                 for (icon, id) in [("⏮", "tr_home"), ("⏪", "tr_back"), ("▶", "tr_play"), ("⏩", "tr_fwd"), ("⏭", "tr_end")] {
                     let r = Rect::from_center_size(pos2(x + 14.0, cy), vec2(28.0, 28.0));
@@ -1319,7 +1529,7 @@ impl GrainApp {
                 }
                 // big timecode
                 p.text(pos2(x + 12.0, cy), egui::Align2::LEFT_CENTER, fmt_tc_frames(self.video.playhead), FontId::monospace(18.0), INK);
-                p.text(pos2(x + 12.0, cy + 12.0), egui::Align2::LEFT_TOP, format!("{:.0} fps  ·  dur {}", self.video.fps, fmt_tc_frames(total)), FontId::proportional(9.0), SUB);
+                p.text(pos2(x + 12.0, cy + 12.0), egui::Align2::LEFT_TOP, format!("{:.0} fps UI · {:.0} fps video · dur {}", self.fps_smoothed.max(0.0), self.video.fps, fmt_tc_frames(total)), FontId::proportional(9.0), SUB);
                 // Workspace layout switcher — never auto-restyles or resizes
                 // the interface when a different dock tab is selected.
                 let lr = Rect::from_min_size(pos2(rect.right() - 154.0, cy - 11.0), vec2(88.0, 22.0));
@@ -1343,10 +1553,10 @@ impl GrainApp {
                     let r = Rect::from_min_size(pos2(xc - 20.0, rect.min.y + 7.0), vec2(20.0, 30.0));
                     let resp = ui.interact(r, Id::new(id), Sense::click());
                     if resp.hovered() { p.rect_filled(r, 2.0, if id == "win_close" { Color32::from_rgb(0xc4, 0x2f, 0x34) } else { LINE }); }
-                    self.draw_marlett(p, r, glyph, col);
+                    self.draw_marlett(&p, r, glyph, col);
                     if resp.clicked() {
                         match id {
-                            "win_close" => ctx.send_viewport_cmd(egui::ViewportCommand::Close),
+                            "win_close" => { self.pending_close_window = true; self.close_project_open = true; }
                             "win_min" => ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true)),
                             "win_max" => {
                                 self.window_maximized = !maximized;
@@ -1358,6 +1568,8 @@ impl GrainApp {
                     xc -= 20.0;
                 }
             });
+        self.render_project_popups(ctx);
+        self.render_go_to_time_popup(ctx);
     }
 }
 
@@ -1395,6 +1607,10 @@ impl eframe::App for GrainApp {
         });
 
         let dt = ctx.input(|i| i.stable_dt).min(0.1);
+        if dt > 0.0001 {
+            let instant_fps = 1.0 / dt;
+            self.fps_smoothed = if self.fps_smoothed <= 0.0 { instant_fps } else { self.fps_smoothed * 0.92 + instant_fps * 0.08 };
+        }
         self.phase_t += dt;
         match self.phase {
             AppPhase::Splash => { if self.phase_t >= 2.6 { self.phase = AppPhase::Loading; self.phase_t = 0.0; } }
@@ -1446,9 +1662,8 @@ impl eframe::App for GrainApp {
                     del && !i.modifiers.shift,
                     del && i.modifiers.shift,
                     i.key_pressed(egui::Key::D) && cmd,
-                    i.key_pressed(egui::Key::G) && cmd && !i.modifiers.shift,
-                    i.key_pressed(egui::Key::G) && cmd && i.modifiers.shift,
                     i.key_pressed(egui::Key::A) && cmd,
+                    i.key_pressed(egui::Key::B) && cmd,
                 )
             });
             if keys.0 { self.timeline_ui.snap = !self.timeline_ui.snap; }
@@ -1456,12 +1671,33 @@ impl eframe::App for GrainApp {
             if keys.2 { self.delete_selected(true); }
             if keys.3 { self.delete_selected(false); }
             if keys.4 { self.duplicate_selected(); }
-            if keys.5 { self.group_selected(); }
-            if keys.6 { self.ungroup_selected(); }
-            if keys.7 {
+            if keys.6 { self.split_at_playhead(); }
+            if keys.5 {
                 let (_, _, refs) = self.timeline_snapshot();
                 self.timeline_ui.set_selection(refs.keys().copied().collect());
             }
+
+            // Vegas-style keyboard navigation + grouping.
+            let (go_to_time, group, ungroup) = ctx.input(|i| {
+                let cmd = i.modifiers.command;
+                let g = i.key_pressed(egui::Key::G);
+                (g && cmd && !i.modifiers.shift && !i.modifiers.alt,
+                 g && cmd && i.modifiers.shift && !i.modifiers.alt,
+                 g && cmd && i.modifiers.shift && i.modifiers.alt)
+            });
+            if go_to_time {
+                self.go_to_time_input = fmt_tc_frames(self.video.playhead);
+                self.go_to_time_open = true;
+            }
+            if group { self.group_selected(); }
+            if ungroup { self.ungroup_selected(); }
+
+            let (zoom_in, zoom_out) = ctx.input(|i| (
+                i.key_pressed(egui::Key::Plus) || i.key_pressed(egui::Key::Equals),
+                i.key_pressed(egui::Key::Minus),
+            ));
+            if zoom_in { self.timeline_ui.zoom = (self.timeline_ui.zoom * 1.2).clamp(8.0, 400.0); self.video.tl_zoom = self.timeline_ui.zoom; }
+            if zoom_out { self.timeline_ui.zoom = (self.timeline_ui.zoom / 1.2).clamp(8.0, 400.0); self.video.tl_zoom = self.timeline_ui.zoom; }
         }
         self.sync_audio_controls();
         let transport_was_playing = self.video.is_playing || self.audio.is_playing;
@@ -1487,7 +1723,8 @@ impl eframe::App for GrainApp {
             self.set_transport_playing(false);
         }
         if self.video.is_playing || self.audio.is_playing {
-            ctx.request_repaint();
+            // Drive the transport independently of mouse motion at 120 Hz.
+            ctx.request_repaint_after(std::time::Duration::from_millis(8));
         }
 
         // Drag-and-drop media & OpenFX import: hover overlay + drop handler
@@ -1532,7 +1769,7 @@ impl eframe::App for GrainApp {
         let mut tl_imported: Option<std::path::PathBuf> = None;
         if layout.timeline_open {
             let resp = egui::TopBottomPanel::bottom(format!("grain_timeline_{}", li))
-                .resizable(true)
+                .resizable(false)
                 .min_height(120.0)
                 .default_height(layout.timeline_height.max(120.0))
                 .frame(egui::Frame::default().fill(PANEL).stroke(Stroke::new(1.0_f32, LINE)).inner_margin(egui::Margin::same(0.0)))
@@ -1546,7 +1783,7 @@ impl eframe::App for GrainApp {
         // Left dock: dynamically sized by the active workspace.
         if layout.left_open {
             let resp = egui::SidePanel::left(format!("grain_dock_{}", li))
-                .resizable(true)
+                .resizable(false)
                 .min_width(200.0)
                 .default_width(layout.left_width.max(200.0))
                 .frame(egui::Frame::default().fill(PANEL).stroke(Stroke::new(1.0_f32, LINE)).inner_margin(egui::Margin::same(0.0)))
@@ -1557,7 +1794,7 @@ impl eframe::App for GrainApp {
         // Right dock: properties inspector (video grade).
         if layout.right_open {
             let resp = egui::SidePanel::right(format!("grain_inspector_{}", li))
-                .resizable(true)
+                .resizable(false)
                 .min_width(220.0)
                 .default_width(layout.right_width.max(220.0))
                 .frame(egui::Frame::default().fill(PANEL).stroke(Stroke::new(1.0_f32, LINE)).inner_margin(egui::Margin::same(0.0)))
@@ -1695,19 +1932,43 @@ impl GrainApp {
                 DockTab::Transitions => self.render_transitions_tab(ui),
                 DockTab::VideoFx => self.render_video_fx_tab(ui),
                 DockTab::ColorGrading => self.render_color_grading_tab(ui),
-                DockTab::AudioFx => {
-                    let mut seek = None;
-                    self.audio.render_rack(ui, ctx, &mut self.plugins, &mut self.video.track_mute[2], &mut self.video.music, &self.audio_engine, &mut seek);
-                    self.video.is_playing = self.audio.is_playing;
-                    self.video.track_solo[2] = self.audio.solo;
-                    if let Some(t) = seek { self.seek_transport(t); }
-                }
+                DockTab::AudioFx => {}
                 DockTab::Titles => self.render_titles_tab(ui),
                 DockTab::Ofx => self.render_ofx_tab(ui),
                 DockTab::Plugins => self.render_plugins_tab(ui),
                 DockTab::Export => self.render_export_tab(ui, ctx),
             });
         });
+        if self.dock == DockTab::AudioFx { self.render_audio_tab_window(ctx); }
+    }
+
+    /// Audio FX rewritten as a standalone `egui` window rather than a cramped
+    /// dock strip. The left dock keeps its current size and layout.
+    fn render_audio_tab_window(&mut self, ctx: &egui::Context) {
+        egui::Window::new("Audio FX")
+            .collapsible(true)
+            .resizable(false)
+            .default_width(460.0)
+            .default_height(560.0)
+            .min_width(460.0)
+            .max_width(460.0)
+            .show(ctx, |ui| {
+                egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+                    let mut seek = None;
+                    self.audio.render_rack(
+                        ui,
+                        ctx,
+                        &mut self.plugins,
+                        &mut self.video.track_mute[2],
+                        &mut self.video.music,
+                        &self.audio_engine,
+                        &mut seek,
+                    );
+                    self.video.is_playing = self.audio.is_playing;
+                    self.video.track_solo[2] = self.audio.solo;
+                    if let Some(t) = seek { self.seek_transport(t); }
+                });
+            });
     }
 
     /// VST2 / VST3 / Apple AudioUnit browser and insertion chain.
@@ -2266,11 +2527,13 @@ impl GrainApp {
                         intensity: 1.2,
                         p_a: 0.5,
                         p_b: 25.0,
+                        params: Vec::new(),
                     });
                 }
             }
         }
         self.video.status = format!("Applied effect: {} (tune in Properties →)", name);
+        self.project_dirty = true;
         self.video.done = false;
         self.video.dirty = true;
     }
@@ -2575,6 +2838,7 @@ impl GrainApp {
         }
         if let Some(fx_name) = clicked_fx {
             self.apply_video_fx_preset(&fx_name);
+            self.selected_fx = Some(fx_name);
         }
         if let Some(fx_name) = dragged_fx {
             self.dragging_fx_label = Some(fx_name);
@@ -2582,6 +2846,29 @@ impl GrainApp {
         if !self.video.status.is_empty() && !self.video.processing {
             ui.add_space(4.0);
             ui.label(RichText::new(&self.video.status).color(ACCENT).size(10.0));
+        }
+
+        // Effect popup / event-FX list.
+        let ctx = ui.ctx().clone();
+        if let Some(name) = self.selected_fx.clone() {
+            let mut open = true;
+            egui::Window::new(format!("Effect — {}", name))
+                .collapsible(false)
+                .resizable(false)
+                .open(&mut open)
+                .default_width(320.0)
+                .min_width(320.0)
+                .max_width(320.0)
+                .show(&ctx, |ui| {
+                    ui.label(RichText::new(format!("Applied to timeline · {:?} event", self.video.fx_chain_level)).color(SUB).size(10.0));
+                    ui.separator();
+                    ui.label(RichText::new("Tune in Properties. Reorderable event FX and per-clip assignment are preserved.").color(INK).size(10.5));
+                    ui.horizontal(|ui| {
+                        if ui.button("Apply again").clicked() { self.apply_video_fx_preset(&name); }
+                        if ui.button("Close").clicked() { self.selected_fx = None; }
+                    });
+                });
+            if !open { self.selected_fx = None; }
         }
     }
 
@@ -2606,16 +2893,28 @@ impl GrainApp {
             ui.label(RichText::new("OpenFX Host").color(INK).size(12.0));
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                 if ui.add(egui::Button::new(RichText::new("↻ Rescan").color(SUB).size(10.0)).fill(TBBG).rounding(Rounding::same(3.0))).clicked() {
-                    self.ofx_scanned = false;
+                    self.ofx_scanned = true;
+                    self.start_video_fx_scan();
                 }
             });
         });
         ui.label(RichText::new(format!("Engine: {} · libloading dlopen", media_engine::engine_label())).color(SUB).size(10.0));
         ui.add_space(4.0);
-        if !self.ofx_scanned {
-            self.ofx_plugins = ofx_host::scan_ofx_directories(&[]);
+        if !self.ofx_scanned && !self.video_fx_loading {
             self.ofx_scanned = true;
-            if self.ofx_sel.is_none() && !self.ofx_plugins.is_empty() { self.ofx_sel = Some(0); }
+            self.start_video_fx_scan();
+        }
+        self.pump_video_fx();
+        if self.video_fx_loading { ui.ctx().request_repaint(); }
+        if self.video_fx_loading || !self.video_fx_status.is_empty() {
+            ui.horizontal(|ui| {
+                ui.spinner();
+                ui.label(RichText::new(if self.video_fx_paused { "Paused" } else { &self.video_fx_status }).color(SUB).size(10.0));
+                if self.video_fx_loading {
+                    if ui.small_button(if self.video_fx_paused { "Resume" } else { "Pause" }).clicked() { self.video_fx_paused = !self.video_fx_paused; }
+                    if ui.small_button("Cancel").clicked() { self.cancel_video_fx_loading(); }
+                }
+            });
         }
         let n = self.ofx_plugins.len();
         ui.label(RichText::new(format!("{} plugin(s) registered", n)).color(SUB).size(10.0));
@@ -2671,7 +2970,7 @@ impl GrainApp {
                         }
                         let ident = plug.identifier.clone();
                         let kind = OfxFx::classify(&ident);
-                        self.video.ofx_active = Some(OfxFx { ident: ident.clone(), kind, mix, intensity, p_a: pa, p_b: pb });
+                        self.video.ofx_active = Some(OfxFx { ident: ident.clone(), kind, mix, intensity, p_a: pa, p_b: pb, params: plug.params.clone() });
                         self.video.status = format!("OFX “{}” ({:?}) applied — {} params, mix {:.0}%.", ident, kind, plug.params.len(), mix);
                         self.video.done = false;
                         self.video.dirty = true;
@@ -2685,6 +2984,51 @@ impl GrainApp {
                 }
             }
         }
+        self.render_ofx_properties_window(ui.ctx());
+    }
+
+    /// Separate full-property window for the active OFX effect. This exposes
+    /// every plugin parameter, not only the four mapped render controls.
+    fn render_ofx_properties_window(&mut self, ctx: &egui::Context) {
+        if self.video.ofx_active.is_none() { return; }
+        egui::Window::new("OFX Effect Properties")
+            .collapsible(true)
+            .resizable(false)
+            .default_width(380.0)
+            .min_width(380.0)
+            .max_width(380.0)
+            .show(ctx, |ui| {
+                let Some(fx) = &mut self.video.ofx_active else { return };
+                ui.label(RichText::new(&fx.ident).color(INK).size(12.0));
+                ui.label(RichText::new(format!("{:?} · mix {:.0}%", fx.kind, fx.mix)).color(SUB).size(10.0));
+                ui.separator();
+                ui.horizontal(|ui| { ui.label("Mix"); ui.add(Slider::new(&mut fx.mix, 0.0..=100.0)); });
+                ui.horizontal(|ui| { ui.label("Intensity"); ui.add(Slider::new(&mut fx.intensity, 0.0..=5.0)); });
+                ui.horizontal(|ui| { ui.label("Primary"); ui.add(Slider::new(&mut fx.p_a, -10.0..=10.0)); });
+                ui.horizontal(|ui| { ui.label("Secondary"); ui.add(Slider::new(&mut fx.p_b, -100.0..=100.0)); });
+                ui.separator();
+                ui.label(RichText::new("Full OFX plugin properties").color(ACCENT).size(11.0));
+                egui::ScrollArea::vertical().max_height(320.0).show(ui, |ui| {
+                    for (pi, pp) in fx.params.iter_mut().enumerate() {
+                        ui.horizontal(|ui| {
+                            ui.label(RichText::new(&pp.label).color(SUB).size(10.0));
+                            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                ui.label(RichText::new(format!("{} · {:.2}", pp.name, pp.value)).color(INK).font(FontId::monospace(9.0)));
+                            });
+                        });
+                        let min = if pp.min.is_finite() { pp.min } else { -100.0 };
+                        let max = if pp.max.is_finite() && pp.max > min { pp.max } else { min + 1.0 };
+                        ui.add(Slider::new(&mut pp.value, min..=max).show_value(false));
+                        if pi % 4 == 3 { ui.add_space(2.0); }
+                    }
+                });
+                ui.add_space(4.0);
+                if ui.button("Reset properties").clicked() {
+                    for pp in &mut fx.params { pp.value = pp.default_val; }
+                }
+                ui.label(RichText::new("Rendering uses full property data; current pixel pass maps mix/intensity/primary/secondary.").color(SUB).size(9.0));
+            });
+        self.video.dirty = true;
     }
 
     /// Fully render the timeline to a real MP4. Every frame is recomputed with
@@ -3251,7 +3595,7 @@ impl GrainApp {
 
         let end = self.timeline_end().max(1.0);
         let zoom = self.timeline_ui.zoom;
-        let new_video_lane = self.video.video_track_count();
+        let new_video_lane = tracks.len();
         let last_lane_bottom = lane_tops.last().copied().unwrap_or(0.0)
             + heights.last().copied().unwrap_or(0.0);
         let lane_at = |y: f32| -> Option<usize> {
@@ -3263,7 +3607,8 @@ impl GrainApp {
             if y >= last_lane_bottom { return Some(new_video_lane); }
             None
         };
-        let candidates = timeline::snap_candidates(&items, self.video.playhead, end);
+        let mut candidates = timeline::snap_candidates(&items, self.video.playhead, end);
+        candidates.extend(self.video.markers.iter().copied());
         let zoom_now = zoom;
         let snap_t = self.timeline_ui.snap;
         let snap_time = |t: f32| {
@@ -3394,13 +3739,26 @@ impl GrainApp {
                     p.text(pos2(a1r.left() + 6.0, a1r.center().y), egui::Align2::LEFT_CENTER,
                         format!("{} · master", self.audio.filename), FontId::proportional(9.0), CLIP_TXT);
 
-                    // Clips.
+                    // Clips. Dragged clips render live at their target lane/time.
+                    let drag_snapshot = self.timeline_ui.drag.clone();
                     for it in &items {
                         if it.track == a1_lane { continue; }
-                        let r = Rect::from_min_size(pos2(body.left() + it.start * zoom, body.top() + lane_tops[it.track] + 3.0),
-                            vec2((it.dur * zoom).max(8.0), heights[it.track] - 6.0));
+                        let first_drag_start = drag_snapshot.as_ref()
+                            .and_then(|d| d.starts.first().copied()).unwrap_or(0.0);
+                        let (render_track, render_start) = if let Some(d) = &drag_snapshot {
+                            if d.uids.contains(&it.uid) && d.mode == TlDragMode::Move {
+                                let original = d.uids.iter().position(|u| *u == it.uid)
+                                    .and_then(|idx| d.starts.get(idx).copied())
+                                    .unwrap_or(it.start);
+                                (d.target_track.min(tracks.len().saturating_sub(1)),
+                                 (d.target_start + original - first_drag_start).max(0.0))
+                            } else { (it.track, it.start) }
+                        } else { (it.track, it.start) };
+                        if render_track >= tracks.len() { continue; }
+                        let r = Rect::from_min_size(pos2(body.left() + render_start * zoom, body.top() + lane_tops[render_track] + 3.0),
+                            vec2((it.dur * zoom).max(8.0), heights[render_track] - 6.0));
                         let mut fill = it.kind.color();
-                        if !tracks[it.track].header.visible { fill = Color32::from_gray(48); }
+                        if !tracks[render_track].header.visible { fill = Color32::from_gray(48); }
                         p.rect_filled(r, 2.0, fill);
                         if it.compound { p.rect_filled(Rect::from_min_size(r.min, vec2(r.width(), 3.0)), 0.0, CLIP_CMP); }
                         // Thumbnail / waveform strip.
@@ -3419,7 +3777,7 @@ impl GrainApp {
                             }
                         }
                         // Trim handles.
-                        let hw = 6.0_f32.min(r.width() * 0.25);
+                        let hw = 10.0_f32.min(r.width() * 0.33);
                         p.rect_filled(Rect::from_min_size(r.min, vec2(hw, r.height())), 1.0, Color32::from_rgba_unmultiplied(255, 255, 255, 70));
                         p.rect_filled(Rect::from_min_size(pos2(r.right() - hw, r.top()), vec2(hw, r.height())), 1.0, Color32::from_rgba_unmultiplied(255, 255, 255, 70));
                         let label = if it.kind == TrackKind::Text { it.label.clone() } else { format!("{}  {:.1}s", it.label, it.dur) };
@@ -3433,11 +3791,13 @@ impl GrainApp {
 
                     // Drag ghost / marquee.
                     if let Some(d) = &self.timeline_ui.drag {
-                        let ghost = Rect::from_min_size(
-                            pos2(body.left() + d.target_start * zoom, body.top() + lane_tops[d.target_track] + 2.0),
-                            vec2(12.0_f32.max(zoom * 0.4), heights[d.target_track] - 4.0),
-                        );
-                        p.rect_stroke(ghost, 2.0, Stroke::new(2.0_f32, AMBER));
+                        if d.target_track < tracks.len() {
+                            let ghost = Rect::from_min_size(
+                                pos2(body.left() + d.target_start * zoom, body.top() + lane_tops[d.target_track] + 2.0),
+                                vec2(12.0_f32.max(zoom * 0.4), heights[d.target_track] - 4.0),
+                            );
+                            p.rect_stroke(ghost, 2.0, Stroke::new(2.0_f32, AMBER));
+                        }
                     }
                     if let Some(m) = self.timeline_ui.marquee { p.rect_filled(m, 0.0, Color32::from_rgba_unmultiplied(59, 196, 232, 35)); p.rect_stroke(m, 0.0, Stroke::new(1.0_f32, ACCENT)); }
 
@@ -3491,7 +3851,12 @@ impl GrainApp {
                                                 } else if additive {
                                                     self.timeline_ui.select(it.uid, true);
                                                 }
-                                                let uids: Vec<u64> = self.timeline_ui.selection.clone();
+                                                let uids: Vec<u64> = self.timeline_ui.selection.iter().copied()
+                                                    .filter(|u| {
+                                                        items.iter().find(|it| it.uid == *u)
+                                                            .map(|it| !it.locked && !tracks[it.track].header.lock)
+                                                            .unwrap_or(false)
+                                                    }).collect();
                                                 let starts: Vec<f32> = uids.iter()
                                                     .filter_map(|u| items.iter().find(|it| it.uid == *u).map(|it| it.start))
                                                     .collect();
@@ -3524,9 +3889,32 @@ impl GrainApp {
                         if down {
                             if let Some(q) = pointer {
                                 let delta = (q.x - d.pointer_start.x) / zoom;
-                                let mut ns = (d.starts.first().copied().unwrap_or(0.0) + delta).max(0.0);
-                                if snap_t { ns = snap_time(ns); }
-                                d.target_start = ns.min(end);
+                                let first = d.starts.first().copied().unwrap_or(0.0);
+                                let first_item = items.iter().find(|it| d.uids.first().copied() == Some(it.uid));
+                                let first_dur = first_item.map(|it| it.dur).unwrap_or(0.0);
+                                let mut ns = first + delta;
+                                if snap_t && d.mode != TlDragMode::Slip && delta.abs() * zoom >= 3.0 {
+                                    // Snap the edge actually being dragged; never snap slip to timeline edges.
+                                    let undragged: Vec<TimelineItem> = items.iter()
+                                        .filter(|it| !d.uids.contains(&it.uid)).cloned().collect();
+                                    let mut drag_candidates = timeline::snap_candidates(&undragged, self.video.playhead, end);
+                                    drag_candidates.extend(self.video.markers.iter().copied());
+                                    let base = if d.mode == TlDragMode::TrimOut { first + first_dur } else { first };
+                                    drag_candidates.retain(|c| (*c - base).abs() > 0.001);
+                                    let mut best = base + delta;
+                                    let mut best_d = 6.0 / zoom.max(1.0);
+                                    let edge = best;
+                                    for &c in &drag_candidates {
+                                        let dd = (edge - c).abs();
+                                        if dd < best_d { best_d = dd; best = c; }
+                                    }
+                                    ns = match d.mode {
+                                        TlDragMode::TrimOut => first + best - base,
+                                        _ => best,
+                                    };
+                                }
+                                if d.mode == TlDragMode::Slip { d.target_start = ns.max(0.0); }
+                                else { d.target_start = ns.clamp(0.0, end); }
                                 if let Some(lane) = lane_at(q.y - body.top()) { d.target_track = lane; }
                             }
                         }
@@ -3561,9 +3949,9 @@ impl GrainApp {
         });
             });
 
-        // Important: every scrub/seek path above already calls `seek_transport`;
-        // this mirror keeps the audio rack playhead in step on the same frame.
-        self.audio.playhead = self.video.playhead;
+        // Every scrub/seek path calls `seek_transport`, which owns both clocks.
+        // Do not overwrite `audio.playhead` here; `render_timeline` runs after
+        // transport reconciliation and would otherwise break A/V sync.
         self.video.tl_zoom = self.timeline_ui.zoom;
         self.video.status = format!("{} · {} track(s) · {} selected",
             self.timeline_ui.tool.label(), tracks.len(), self.timeline_ui.selection.len());
@@ -3613,24 +4001,32 @@ impl GrainApp {
         let (_, _, refs) = self.timeline_snapshot();
         let first = d.starts.first().copied().unwrap_or(d.target_start);
         let delta = d.target_start - first;
-        let target_kind = kinds.get(d.target_track).copied().unwrap_or(TrackKind::Video);
+        let kinds_len = kinds.len();
+        let new_video_track = kinds.iter().take_while(|k| **k == TrackKind::Video).count();
+        let target_video_track = if d.target_track == kinds_len { new_video_track } else { d.target_track };
+        let target_kind = if d.target_track == kinds_len {
+            TrackKind::Video
+        } else {
+            kinds.get(d.target_track).copied().unwrap_or(TrackKind::Video)
+        };
 
         match d.mode {
             TlDragMode::Move | TlDragMode::Slide => {
                 let mut v1: Vec<(u64, f32)> = Vec::new();
                 for (uid, orig) in d.uids.iter().zip(d.starts.iter()) {
+                    if self.is_uid_locked(*uid) { continue; }
                     let r = match refs.get(uid) { Some(r) => *r, None => continue };
                     let ns = (d.target_start + (*orig - first)).max(0.0);
                     match r {
                         ItemRef::V1(_) => v1.push((*uid, ns)),
-                        _ => self.move_item_to(r, ns, d.target_track, target_kind, first_audio_lane, d.mode == TlDragMode::Slide),
+                        _ => self.move_item_to(r, ns, target_video_track, target_kind, first_audio_lane, d.mode == TlDragMode::Slide),
                     }
                 }
                 if !v1.is_empty() {
-                    if target_kind == TrackKind::Video && d.target_track == 0 {
+                    if target_kind == TrackKind::Video && target_video_track == 0 {
                         self.move_v1_items(&v1);
                     } else if target_kind == TrackKind::Video {
-                        let vt = d.target_track.max(1);
+                        let vt = target_video_track.max(1);
                         self.move_v1_items_to_extra(&v1, vt);
                     }
                 }
@@ -3639,16 +4035,19 @@ impl GrainApp {
             TlDragMode::TrimIn | TlDragMode::TrimOut => {
                 let dt = (d.target_start - first).max(-100.0).min(100.0);
                 for uid in &d.uids {
+                    if self.is_uid_locked(*uid) { continue; }
                     if let Some(&r) = refs.get(uid) { self.trim_item(r, d.mode, dt); }
                 }
             }
             TlDragMode::Slip => {
                 for uid in &d.uids {
+                    if self.is_uid_locked(*uid) { continue; }
                     if let Some(&r) = refs.get(uid) { self.slip_item(r, delta); }
                 }
             }
         }
         self.video.dirty = true;
+        self.project_dirty = true;
         let _ = zoom;
     }
 
@@ -3656,7 +4055,7 @@ impl GrainApp {
     fn move_v1_items(&mut self, moved: &[(u64, f32)]) {
         let uids: Vec<u64> = moved.iter().map(|(u, _)| *u).collect();
         let block: Vec<(VideoClip, f32)> = self.video.seq.iter()
-            .filter(|c| uids.contains(&c.uid))
+            .filter(|c| uids.contains(&c.uid) && !self.is_uid_locked(c.uid))
             .map(|c| {
                 let start = moved.iter().find(|(u, _)| *u == c.uid).map(|(_, s)| *s).unwrap_or(0.0);
                 (c.clone(), start)
@@ -3685,20 +4084,17 @@ impl GrainApp {
         self.ensure_video_lane(vt);
         let uids: Vec<u64> = moved.iter().map(|(u, _)| *u).collect();
         let mut block: Vec<VideoClip> = self.video.seq.iter()
-            .filter(|c| uids.contains(&c.uid)).cloned().collect();
+            .filter(|c| uids.contains(&c.uid) && !self.is_uid_locked(c.uid)).cloned().collect();
         block.sort_by(|a, b| {
             let sa = moved.iter().find(|(u, _)| *u == a.uid).map(|(_, s)| *s).unwrap_or(0.0);
             let sb = moved.iter().find(|(u, _)| *u == b.uid).map(|(_, s)| *s).unwrap_or(0.0);
             sa.total_cmp(&sb)
         });
         self.video.seq.retain(|c| !uids.contains(&c.uid));
-        let mut start = block.first()
-            .and_then(|c| moved.iter().find(|(u, _)| *u == c.uid).map(|(_, s)| *s))
-            .unwrap_or(0.0);
         for mut c in block {
+            let start = moved.iter().find(|(u, _)| *u == c.uid).map(|(_, s)| *s).unwrap_or(0.0);
             c.track = vt;
-            c.start = start;
-            start += c.len();
+            c.start = start.max(0.0);
             self.video.extra_tracks[vt - 1].push(c);
         }
         self.video.video_stream = None;
@@ -3729,6 +4125,7 @@ impl GrainApp {
             ItemRef::Music(i) => self.video.music.get(i).map(|m| m.uid),
             _ => None,
         }.unwrap_or(0);
+        if self.is_uid_locked(uid) { return; }
         match r {
             ItemRef::V1(_) => {} // handled by move_v1_items
             ItemRef::Video { track, index } => {
@@ -3748,15 +4145,11 @@ impl GrainApp {
                     }
                 } else if lane >= 1 {
                     self.ensure_video_lane(lane);
-                    let mut c = self.video.extra_tracks.get(track.wrapping_sub(1)).and_then(|t| t.get(index)).cloned();
-                    if let Some(cc) = c.as_mut() {
-                        cc.start = start;
-                        cc.track = lane;
-                        let mut taken = None;
-                        if let Some(t) = self.video.extra_tracks.get_mut(track - 1) { taken = Some(t.remove(index)); }
-                        if let Some(cc) = taken {
-                            self.video.extra_tracks[lane - 1].push(cc);
-                        }
+                    if let Some(mut c) = self.video.extra_tracks.get(track.wrapping_sub(1)).and_then(|t| t.get(index)).cloned() {
+                        if let Some(t) = self.video.extra_tracks.get_mut(track - 1) { t.remove(index); }
+                        c.start = start.max(0.0);
+                        c.track = lane;
+                        self.video.extra_tracks[lane - 1].push(c);
                     }
                 }
                 if ripple && lane == track { self.ripple_video(track, old.0, old.1, start - old.0, uid); }
@@ -3802,6 +4195,14 @@ impl GrainApp {
 
     fn trim_item(&mut self, r: ItemRef, mode: TlDragMode, dt: f32) {
         let min_span = timeline::MIN_CLIP;
+        let uid = match r {
+            ItemRef::V1(i) => self.video.seq.get(i).map(|c| c.uid),
+            ItemRef::Video { track, index } => self.video.extra_tracks.get(track.wrapping_sub(1)).and_then(|t| t.get(index)).map(|c| c.uid),
+            ItemRef::Overlay(i) => self.video.overlays.get(i).map(|o| o.uid),
+            ItemRef::Music(i) => self.video.music.get(i).map(|m| m.uid),
+            ItemRef::Text(i) => self.video.texts.get(i).map(|t| t.uid),
+        }.unwrap_or(0);
+        if self.is_uid_locked(uid) { return; }
         match r {
             ItemRef::V1(i) => {
                 if let Some(c) = self.video.seq.get_mut(i) { Self::trim_video_clip(c, mode, dt, min_span); }
@@ -3868,6 +4269,12 @@ impl GrainApp {
     }
 
     fn slip_item(&mut self, r: ItemRef, dt: f32) {
+        let uid = match r {
+            ItemRef::V1(i) => self.video.seq.get(i).map(|c| c.uid),
+            ItemRef::Video { track, index } => self.video.extra_tracks.get(track.wrapping_sub(1)).and_then(|t| t.get(index)).map(|c| c.uid),
+            _ => None,
+        }.unwrap_or(0);
+        if self.is_uid_locked(uid) { return; }
         let edit = match r {
             ItemRef::V1(i) => self.video.seq.get(i).map(|c| (c.a, c.b, c.dur / c.speed.max(0.01))),
             ItemRef::Video { track, index } => self.video.extra_tracks.get(track.wrapping_sub(1))
@@ -3969,6 +4376,7 @@ impl GrainApp {
             }
         }
         self.video.dirty = true;
+        self.project_dirty = true;
         self.video.status = format!("Split at {}", timeline::format_tc(t, self.video.fps));
     }
 
@@ -4026,6 +4434,7 @@ impl GrainApp {
         self.video.extra_sel = None;
         self.video.video_stream = None;
         self.video.dirty = true;
+        self.project_dirty = true;
         self.video.status = if ripple { "Ripple deleted selected clip(s)".into() } else { "Lifted selected clip(s)".into() };
     }
 
@@ -4556,10 +4965,11 @@ impl AudioState {
                         });
 
                         let fx_btn = egui::Button::new(RichText::new("Effects").color(aud_dark_txt).size(9.5))
-                            .fill(aud_btn_bg)
+                            .fill(if self.audio_fx_popup_open { ACCENT2 } else { aud_btn_bg })
                             .stroke(Stroke::new(1.0_f32, aud_btn_border))
                             .min_size(vec2(92.0, 18.0));
-                        if ui.add(fx_btn).clicked() {
+                        if ui.add(fx_btn).on_hover_text("Open Audio FX in a new window").clicked() {
+                            self.audio_fx_popup_open = !self.audio_fx_popup_open;
                             self.status = format!("Active DSP: {}", self.fx_tab.label());
                         }
 
@@ -4755,6 +5165,11 @@ impl AudioState {
                 }
                 FxTab::SpeedPitch => {
                     slider_row_f(ui, "Rate", &mut self.s_amt, 0.4, 2.5, 0.01, |v| format!("{:.2}×", v));
+                    ui.checkbox(&mut self.s_sliding, "Sliding speed / pitch (Audacity)");
+                    if self.s_sliding {
+                        slider_row_f(ui, "Start rate", &mut self.s_start, 0.02, 4.0, 0.01, |v| format!("{:.2}×", v));
+                        slider_row_f(ui, "End rate", &mut self.s_end, 0.02, 4.0, 0.01, |v| format!("{:.2}×", v));
+                    }
                 }
                 FxTab::Bitcrush => {
                     slider_row_i(ui, "Bit depth", &mut self.b_bits, 1, 16, |v| format!("{}", v));
@@ -4836,6 +5251,50 @@ impl AudioState {
                 )).color(SUB).size(9.0));
             }
         });
+        self.render_audio_fx_popup(ctx, plugins);
+    }
+
+    fn render_audio_fx_popup(&mut self, ctx: &egui::Context, plugins: &mut PluginChain) {
+        if !self.audio_fx_popup_open { return; }
+        let mut open = true;
+        egui::Window::new("Audio FX")
+            .collapsible(true)
+            .resizable(false)
+            .open(&mut open)
+            .default_width(360.0)
+            .default_height(420.0)
+            .min_width(360.0)
+            .max_width(360.0)
+            .show(ctx, |ui| {
+                ui.label(RichText::new("Audio FX · new window").color(INK).size(13.0));
+                ui.label(RichText::new("Non-destructive DSP + VST2 / VST3 / AU chain").color(SUB).size(10.0));
+                ui.separator();
+                ui.horizontal_wrapped(|ui| {
+                    for &t in FxTab::ALL {
+                        let active = self.fx_tab == t;
+                        if ui.add(egui::Button::new(RichText::new(t.label()).color(if active { CLIP_TXT } else { SUB }).size(10.0))
+                            .fill(if active { ACCENT } else { Color32::TRANSPARENT })
+                            .stroke(Stroke::new(1.0_f32, LINE)).rounding(Rounding::same(3.0))).clicked() { self.fx_tab = t; }
+                    }
+                });
+                ui.add_space(4.0);
+                ui.label(RichText::new(self.fx_tab.note()).color(SUB).size(10.0));
+                ui.separator();
+                ui.label(RichText::new(format!("{} plug-in slot(s) active", plugins.active_count())).color(SUB).size(10.0));
+                ui.add_space(4.0);
+                if ui.add(egui::Button::new(RichText::new("Apply Effect & Render WAV").color(Color32::WHITE))
+                    .fill(ACCENT2).rounding(Rounding::same(4.0)).min_size(vec2(ui.available_width(), 28.0))).clicked()
+                {
+                    let out_path = media_engine::default_export_path("grain_audio_export.wav");
+                    let out_str = out_path.to_string_lossy().to_string();
+                    match self.render_real(&out_str, plugins) {
+                        Ok(notes) => { self.done = true; self.status = format!("Rendered → {}{}", out_str, if notes.is_empty() { String::new() } else { format!(" · {}", notes.join(" · ")) }); }
+                        Err(e) => { self.done = false; self.status = format!("Render error: {e}"); }
+                    }
+                }
+                if !self.status.is_empty() { ui.label(RichText::new(&self.status).color(ACCENT).size(10.0)); }
+            });
+        if !open { self.audio_fx_popup_open = false; }
     }
 
     fn to_lab(&self) -> AudioLabState {
@@ -4868,6 +5327,9 @@ impl AudioState {
         st.vibrato_rate = self.v_rate;
         st.vibrato_depth = self.v_depth;
         st.speed_pitch_rate = self.s_amt;
+        st.speed_pitch_start = self.s_start;
+        st.speed_pitch_end = self.s_end;
+        st.speed_pitch_sliding = self.s_sliding;
         st.bit_depth = self.b_bits.clamp(1, 16) as u8;
         st.sr_divisor = self.b_sr.max(1) as u32;
         st.vocoder_wave = match self.vc_wave { VocWave::Saw => CarrierWave::Saw, VocWave::Square => CarrierWave::Square, VocWave::Pulse => CarrierWave::Pulse, VocWave::Sine => CarrierWave::Sine };
@@ -5555,7 +6017,7 @@ impl VideoState {
         let mut out = Vec::with_capacity(w * h * 4);
         for p in &px { out.push((p[0].clamp(0.0, 1.0) * 255.0) as u8); out.push((p[1].clamp(0.0, 1.0) * 255.0) as u8); out.push((p[2].clamp(0.0, 1.0) * 255.0) as u8); out.push(255); }
         self.last_rgba = out.clone();
-        let img = ColorImage::from_rgba_unmultiplied([w, h], &out);
+        let img = ColorImage::from_rgba_unmultiplied([w, h], &self.last_rgba);
         let opts = egui::TextureOptions::default();
         if let Some(t) = self.out_tex.as_mut() { t.set(img, opts); }
         else { self.out_tex = Some(ctx.load_texture("grain_preview", img, opts)); }
@@ -5808,12 +6270,12 @@ impl VideoState {
         }
         // text overlays (with shadow) — Text track M/S is respected
         if self.track_active(4) {
-            for t in self.texts.clone() {
+            for t in &self.texts {
                 if self.playhead < t.a || (t.b < 1e8 && self.playhead > t.b) { continue; }
                 let px = t.size / 100.0 * ph;
                 let pos = pos2(rect.left() + t.x / 100.0 * pw, rect.top() + t.y / 100.0 * ph);
-                p.text(pos + vec2(1.0, 1.0), egui::Align2::CENTER_CENTER, t.t.clone(), FontId::proportional(px), Color32::from_rgba_unmultiplied(0, 0, 0, 180));
-                p.text(pos, egui::Align2::CENTER_CENTER, t.t.clone(), FontId::proportional(px), t.col);
+                p.text(pos + vec2(1.0, 1.0), egui::Align2::CENTER_CENTER, &t.t, FontId::proportional(px), Color32::from_rgba_unmultiplied(0, 0, 0, 180));
+                p.text(pos, egui::Align2::CENTER_CENTER, &t.t, FontId::proportional(px), t.col);
             }
         }
         // overlay picture-in-picture — V2 track M/S is respected. Imported
@@ -5821,7 +6283,7 @@ impl VideoState {
         // remain for named-but-unlinked overlays.
         if self.track_active(1) {
             let uv = Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0));
-            for o in self.overlays.clone() {
+            for o in &self.overlays {
                 if self.playhead < o.start || self.playhead > o.start + o.dur { continue; }
                 let w = rect.width() * o.s / 100.0; let h = w * 9.0 / 16.0;
                 let cx = rect.left() + o.x / 100.0 * pw; let cy = rect.top() + o.y / 100.0 * ph;
@@ -6262,6 +6724,25 @@ fn select_row_u8(ui: &mut Ui, label: &str, current: u8, opts: &[&str]) -> u8 {
 // ===========================================================================
 // Shared UI helpers + timecode + main
 // ===========================================================================
+fn parse_timecode(input: &str, fps: f32) -> Option<f32> {
+    let input = input.trim();
+    if input.is_empty() { return None; }
+    if let Ok(seconds) = input.parse::<f32>() { return seconds.is_finite().then(|| seconds.max(0.0)); }
+    let parts: Vec<&str> = input.split(':').map(str::trim).collect();
+    if parts.iter().any(|p| p.is_empty()) { return None; }
+    let nums: Vec<f64> = parts.iter().filter_map(|p| p.parse::<f64>().ok()).collect();
+    if nums.len() != parts.len() { return None; }
+    let fps = fps.max(1.0) as f64;
+    let t = match nums.len() {
+        1 => nums[0],
+        2 => nums[0] * 60.0 + nums[1],
+        3 => nums[0] * 3600.0 + nums[1] * 60.0 + nums[2],
+        4 => nums[0] * 3600.0 + nums[1] * 60.0 + nums[2] + nums[3] / fps,
+        _ => return None,
+    };
+    (t.is_finite() && t >= 0.0).then_some(t as f32)
+}
+
 fn fmt_tc(sec: f32) -> String {
     let m = (sec / 60.0) as u32;
     let s = sec - (m as f32) * 60.0;
@@ -6341,6 +6822,11 @@ fn main() -> eframe::Result<()> {
     }
     let opts = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default().with_inner_size([1180.0, 760.0]).with_min_inner_size([640.0, 480.0]),
+        // 120 FPS target. egui still uses hardware acceleration; no forced vsync cap.
+        vsync: false,
+        multisampling: 0,
+        depth_buffer: 0,
+        stencil_buffer: 0,
         ..Default::default()
     };
     eframe::run_native("Grain — audio · video lab", opts, Box::new(|_cc| Ok(Box::new(GrainApp::default()))))

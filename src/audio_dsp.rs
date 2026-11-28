@@ -381,6 +381,10 @@ pub struct AudioLabState {
     pub vibrato_depth: f32,
     // Speed + pitch
     pub speed_pitch_rate: f32,
+    /// Audacity-style sliding speed/pitch.
+    pub speed_pitch_start: f32,
+    pub speed_pitch_end: f32,
+    pub speed_pitch_sliding: bool,
     // Bitcrush
     pub bit_depth: u8,
     pub sr_divisor: u32,
@@ -452,6 +456,9 @@ impl Default for AudioLabState {
             vibrato_rate: 5.0,
             vibrato_depth: 0.5,
             speed_pitch_rate: 1.0,
+            speed_pitch_start: 1.0,
+            speed_pitch_end: 1.0,
+            speed_pitch_sliding: false,
             bit_depth: 8,
             sr_divisor: 4,
             vocoder_wave: CarrierWave::Saw,
@@ -588,7 +595,15 @@ fn process_single_channel(
                 vibrato_native(chan, st.vibrato_rate, st.vibrato_depth, srf)
             }
         }
-        AudioTab::SpeedPitch => resample_variable(chan, |_| st.speed_pitch_rate),
+        AudioTab::SpeedPitch => {
+            if st.speed_pitch_sliding {
+                let start = st.speed_pitch_start.max(0.02);
+                let end = st.speed_pitch_end.max(0.02);
+                resample_variable(chan, |t| start + (end - start) * t.clamp(0.0, 1.0))
+            } else {
+                resample_variable(chan, |_| st.speed_pitch_rate.max(0.02))
+            }
+        }
         AudioTab::Bitcrush => bitcrush(chan, st.bit_depth, st.sr_divisor),
         AudioTab::Vocoder => vocoder(chan, st.vocoder_wave, st.vocoder_freq, st.vocoder_bands, srf),
         AudioTab::Tremolo => tremolo(chan, st.tremolo_rate, st.tremolo_wave, st.tremolo_depth, srf),
@@ -819,8 +834,8 @@ pub fn resample_to(chan: &[f32], target_len: usize) -> Vec<f32> {
     let mut out = Vec::with_capacity(target_len);
     let ratio = (chan.len().saturating_sub(1) as f32) / (target_len.saturating_sub(1).max(1) as f32);
     for i in 0..target_len {
-        let pos = i as f32 * ratio;
-        let i0 = pos as usize;
+        let pos = (i as f32 * ratio).clamp(0.0, chan.len().saturating_sub(1) as f32);
+        let i0 = (pos.floor() as usize).min(chan.len() - 1);
         let frac = pos - i0 as f32;
         let a = chan[i0];
         let b = chan.get(i0 + 1).copied().unwrap_or(a);

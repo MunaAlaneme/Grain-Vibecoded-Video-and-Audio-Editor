@@ -70,8 +70,9 @@ retained.
   **U** Slide, **Y** Slip, **Z** Zoom, **H** Hand. Clips are selected by click,
   Ctrl/Shift multi-select or marquee; drags snap to clip edges, the playhead,
   zero and whole seconds. Trim handles, Ripple Delete / Lift, Duplicate, Group /
-  Ungroup (Cmd/Ctrl+G, +Shift to ungroup), markers (**M**), snap toggle (**S**)
-  and Alt+arrow frame nudging are all available. Media-bin drops land on the
+  Ungroup, markers (**M**), snap toggle (**S**), `+`/`−` zoom, **Space** play,
+  frame arrows, and **Cmd/Ctrl+G** go-to-timecode are all available.
+  `Cmd/Ctrl+Shift+G` groups; `Cmd/Ctrl+Shift+Alt+G` ungroups. Media-bin drops land on the
   hovered lane at the hovered time. The ruler, preview and Audio FX waveform
   scrub the same playhead and mirror seeks into the audio engine.
 - **Workspace layouts** — the top-bar **▦** button recalls Editing / Color /

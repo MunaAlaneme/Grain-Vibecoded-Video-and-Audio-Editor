@@ -511,7 +511,6 @@ pub fn inspect_ofx_binary(
                 if ptr.is_null() {
                     continue;
                 }
-                setup_ofx_plugin(ptr);
                 let plug = &*ptr;
                 let apiname = if plug.plugin_api.is_null() {
                     "Unknown".into()
